@@ -1,0 +1,11 @@
+%YAML:1.0
+
+ORB-SLAM3.Vocabulary: "../ORB-SLAM3/Vocabulary/ORBvoc.txt"
+ORB-SLAM3.Parameters: "../cfg/ORB_SLAM3/RGB-D/TUM/tum_freiburg1_desk.yaml"
+
+Mapper.Parameters: "../cfg/gaussian_mapper/RGB-D/TUM/tum_rgbd.yaml"
+
+Dataset: "/home/shaun/Desktop/Photo-SLAM/data/TUM/rgbd_dataset_freiburg3_long_office_household"
+
+Results.Saving: "../results/a_rgbd/rgbd_dataset_freiburg3_long_office_household"
+Results.Viewer: 1 # 0 for no viewer, otherwise for has viewer

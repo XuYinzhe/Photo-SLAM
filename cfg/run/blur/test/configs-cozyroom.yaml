@@ -1,0 +1,11 @@
+%YAML:1.0
+
+Mapper.Parameters: "../cfg/gaussian_mapper/RGB-D/TUM/tum_rgbd.yaml"
+
+Dataset: "/home/shaun/Desktop/3dgs-deblur/data/inputs-processed/synthetic-mb/cozyroom/"
+
+GT: "/home/shaun/Desktop/3dgs-deblur/data/inputs-processed/synthetic-clear/cozyroom/"
+
+Results.Saving: "../results/blur/test-cozyroom"
+
+Results.Viewer: 0 # 0 for no viewer, otherwise for has viewer

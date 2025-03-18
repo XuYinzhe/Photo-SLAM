@@ -1,0 +1,11 @@
+%YAML:1.0
+
+ORB-SLAM3.Vocabulary: "../ORB-SLAM3/Vocabulary/ORBvoc.txt"
+ORB-SLAM3.Parameters: "../cfg/run/l515-g106-area1/orb3-params.yaml"
+
+Mapper.Parameters: "../cfg/gaussian_mapper/RGB-D/TUM/tum_rgbd.yaml"
+
+Dataset: "../data/g106/l151-g106-area1"
+
+Results.Saving: "../results/a_rgbd/l151-g106-area1"
+Results.Viewer: 0 # 0 for no viewer, otherwise for has viewer

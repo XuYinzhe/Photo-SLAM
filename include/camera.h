@@ -132,6 +132,9 @@ public:
 
     float stereo_bf_ = 0.0f;
 
+    float exposure_time = 0.f;
+    float rolling_shutter_time = 0.f;
+
     cv::Mat dist_coeff_ = (cv::Mat_<float>(1, 4) << 0.0f, 0.0f, 0.0f, 0.0f);
     cv::Mat undistort_map1, undistort_map2;
     cv::Mat undistort_mask;

@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 project(photo-slam LANGUAGES CXX CUDA)
 
+option(TESTONLY "Test deblur only." OFF)
+
 if(NOT CMAKE_BUILD_TYPE)
     # set(CMAKE_BUILD_TYPE Debug)
     set(CMAKE_BUILD_TYPE Release)
@@ -172,72 +174,98 @@ target_link_libraries(gaussian_viewer
     glfw
     OpenGL::GL)
 
-##################################################################################
-##  Build the test examples to ${PROJECT_SOURCE_DIR}/bin
-##################################################################################
+if(TESTONLY)
+    message(STATUS "Building deblur test only.")
+    # main modification
+    # add_executable(a_rgbd examples/a_rgbd.cpp)
+    # target_link_libraries(a_rgbd
+    #     gaussian_viewer    
+    #     gaussian_mapper
+    #     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
 
-# This is a C++ libtorch implementation of gaussian-splatting (https://github.com/graphdeco-inria/gaussian-splatting)
-add_executable(train_colmap examples/train_colmap.cpp)
-target_link_libraries(train_colmap
-    gaussian_viewer
-    gaussian_mapper)
+    # train gs
+    add_executable(train_gs examples/train_gs.cpp)
+    target_link_libraries(train_gs
+        gaussian_mapper
+        simple_knn
+        cuda_rasterizer
+        ${TORCH_LIBRARIES}
+        Eigen3::Eigen
+        ${OpenCV_LIBRARIES}
+        jsoncpp_lib
+        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+        glm::glm)
 
-add_executable(view_result examples/view_result.cpp)
-target_link_libraries(view_result
-    gaussian_viewer
-    gaussian_mapper)
+else()
 
-##################################################################################
-##  Build the mapping examples to ${PROJECT_SOURCE_DIR}/bin
-##################################################################################
+    ##################################################################################
+    ##  Build the test examples to ${PROJECT_SOURCE_DIR}/bin
+    ##################################################################################
 
-# Replica Monocular
-add_executable(replica_mono examples/replica_mono.cpp)
-target_link_libraries(replica_mono
-    gaussian_viewer    
-    gaussian_mapper
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+    # This is a C++ libtorch implementation of gaussian-splatting (https://github.com/graphdeco-inria/gaussian-splatting)
+    add_executable(train_colmap examples/train_colmap.cpp)
+    target_link_libraries(train_colmap
+        gaussian_viewer
+        gaussian_mapper)
 
-# Replica Monocular
-add_executable(replica_rgbd examples/replica_rgbd.cpp)
-target_link_libraries(replica_rgbd
-    gaussian_viewer    
-    gaussian_mapper
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+    add_executable(view_result examples/view_result.cpp)
+    target_link_libraries(view_result
+        gaussian_viewer
+        gaussian_mapper)
 
-# TUM Monocular
-add_executable(tum_mono examples/tum_mono.cpp)
-target_link_libraries(tum_mono
-    gaussian_viewer    
-    gaussian_mapper
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+    ##################################################################################
+    ##  Build the mapping examples to ${PROJECT_SOURCE_DIR}/bin
+    ##################################################################################
 
-# TUM RGBD
-add_executable(tum_rgbd examples/tum_rgbd.cpp)
-target_link_libraries(tum_rgbd
-    gaussian_viewer    
-    gaussian_mapper
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
-
-# EuRoC Stereo
-add_executable(euroc_stereo examples/euroc_stereo.cpp)
-target_link_libraries(euroc_stereo
-    gaussian_viewer    
-    gaussian_mapper
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
-
-##################################################################################
-##  Build the mapping examples to ${PROJECT_SOURCE_DIR}/bin
-##################################################################################
-
-# Intel Realsense
-if(realsense2_FOUND)
-    add_executable(realsense_rgbd examples/realsense_rgbd.cpp)
-    target_include_directories(realsense_rgbd PUBLIC
-        ${realsense_INCLUDE_DIR})
-    target_link_libraries(realsense_rgbd
+    # Replica Monocular
+    add_executable(replica_mono examples/replica_mono.cpp)
+    target_link_libraries(replica_mono
         gaussian_viewer    
         gaussian_mapper
-        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-        ${realsense2_LIBRARY})
+        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+
+    # Replica Monocular
+    add_executable(replica_rgbd examples/replica_rgbd.cpp)
+    target_link_libraries(replica_rgbd
+        gaussian_viewer    
+        gaussian_mapper
+        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+
+    # TUM Monocular
+    add_executable(tum_mono examples/tum_mono.cpp)
+    target_link_libraries(tum_mono
+        gaussian_viewer    
+        gaussian_mapper
+        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+
+    # TUM RGBD
+    add_executable(tum_rgbd examples/tum_rgbd.cpp)
+    target_link_libraries(tum_rgbd
+        gaussian_viewer    
+        gaussian_mapper
+        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+
+    # EuRoC Stereo
+    add_executable(euroc_stereo examples/euroc_stereo.cpp)
+    target_link_libraries(euroc_stereo
+        gaussian_viewer    
+        gaussian_mapper
+        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+
+    ##################################################################################
+    ##  Build the mapping examples to ${PROJECT_SOURCE_DIR}/bin
+    ##################################################################################
+
+    # Intel Realsense
+    # if(realsense2_FOUND)
+    #     add_executable(realsense_rgbd examples/realsense_rgbd.cpp)
+    #     target_include_directories(realsense_rgbd PUBLIC
+    #         ${realsense_INCLUDE_DIR})
+    #     target_link_libraries(realsense_rgbd
+    #         gaussian_viewer    
+    #         gaussian_mapper
+    #         ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+    #         ${realsense2_LIBRARY})
+    # endif()
+
 endif()

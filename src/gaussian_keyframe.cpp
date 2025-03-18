@@ -54,6 +54,19 @@ void GaussianKeyframe::setPose(
     this->set_pose_ = true;
 }
 
+void GaussianKeyframe::setPose(std::vector<float> m){
+    m.push_back(0.f);m.push_back(0.f);m.push_back(0.f);m.push_back(1.f);
+    Eigen::Map<Eigen::Matrix4f> eigen_matrix(m.data());
+    Eigen::Matrix4d eigen_matrix_d = eigen_matrix.cast<double>();
+
+    this->Tcw_ = Sophus::SE3d::fitToSE3(eigen_matrix_d);
+    this->R_quaternion_ = this->Tcw_.unit_quaternion();
+    this->R_quaternion_.normalize();
+    this->t_ = this->Tcw_.translation();
+
+    this->set_pose_ = true;
+}
+
 Sophus::SE3d GaussianKeyframe::getPose()
 {
     return this->Tcw_;

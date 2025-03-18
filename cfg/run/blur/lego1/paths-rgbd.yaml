@@ -1,0 +1,11 @@
+%YAML:1.0
+
+ORB-SLAM3.Vocabulary: "../ORB-SLAM3/Vocabulary/ORBvoc.txt"
+ORB-SLAM3.Parameters: "../cfg/run/blur/lego1/orb3-params.yaml"
+
+Mapper.Parameters: "../cfg/gaussian_mapper/RGB-D/TUM/tum_rgbd.yaml"
+
+Dataset: "/home/shaun/Desktop/3dgs-deblur/data/inputs-raw/spectacular-rec/iphone-lego1/data/"
+
+Results.Saving: "../results/blur/lego1"
+Results.Viewer: 1 # 0 for no viewer, otherwise for has viewer

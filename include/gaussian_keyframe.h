@@ -54,6 +54,8 @@ public:
         const Eigen::Quaterniond& q,
         const Eigen::Vector3d& t);
 
+    void setPose(std::vector<float> m);
+
     Sophus::SE3d getPose();
     Sophus::SE3f getPosef();
 

@@ -41,19 +41,20 @@ inline torch::Tensor cvMat2TorchTensor_Float32(
     torch::DeviceType device_type)
 {
     torch::Tensor mat_tensor, tensor;
+    mat.convertTo(mat, CV_32F);
 
     switch (mat.channels())
     {
     case 1:
     {
-        mat_tensor = torch::from_blob(mat.data, /*sizes=*/{mat.rows, mat.cols});
+        mat_tensor = torch::from_blob(mat.data, /*sizes=*/{mat.rows, mat.cols}, torch::kFloat32);
         tensor = mat_tensor.clone().to(device_type);
     }
     break;
 
     case 3:
     {
-        mat_tensor = torch::from_blob(mat.data, /*sizes=*/{mat.rows, mat.cols, mat.channels()});
+        mat_tensor = torch::from_blob(mat.data, /*sizes=*/{mat.rows, mat.cols, mat.channels()}, torch::kFloat32);
         tensor = mat_tensor.clone().to(device_type);
         tensor = tensor.permute({2, 0, 1});
     }
