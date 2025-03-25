@@ -104,11 +104,11 @@ int main(int argc, char* argv[]) {
         auto& mp = vvfloatPLY[i];
         Point3D point3D;
         point3D.xyz_(0) = mp[0];
-        point3D.xyz_(1) = mp[1];
-        point3D.xyz_(2) = mp[2];
-        point3D.color_(0) = mp[3];
-        point3D.color_(1) = mp[4];
-        point3D.color_(2) = mp[5];
+        point3D.xyz_(1) = -mp[1];
+        point3D.xyz_(2) = -mp[2];
+        point3D.color_(0) = mp[3]/255.f;
+        point3D.color_(1) = mp[4]/255.f;
+        point3D.color_(2) = mp[5]/255.f;
         sceneGS->cachePoint3D(i, point3D);
     }
     std::cout<< "Load keyframes." <<std::endl;
@@ -116,11 +116,12 @@ int main(int argc, char* argv[]) {
         std::shared_ptr<GaussianKeyframe> kf = std::make_shared<GaussianKeyframe>(i, 0);
         kf->setCameraParams(camera);
         kf->zfar_ = 100.f; kf->znear_ = 0.01f;
-        kf->setPose(vvfloatPose[i]);
+        kf->setPose(vvfloatPose[i], true);
         kf->img_filename_ = vstrImageNamesRGB[i];
 
         auto imgRGB = cv::imread(vstrImagePathsRGB[i], cv::IMREAD_UNCHANGED);
         cv::cvtColor(imgRGB, imgRGB, CV_BGR2RGB);
+        imgRGB.convertTo(imgRGB, CV_32FC3, 1.0 / 255.0);
         kf->original_image_ = 
             tensor_utils::cvMat2TorchTensor_Float32(imgRGB, torch::kCUDA);
         kf->computeTransformTensors();
@@ -153,7 +154,8 @@ void train(
     torch::Tensor background_color = torch::tensor(bg_color, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
     auto override_color = torch::empty(0, torch::TensorOptions().device(torch::kCUDA));
 
-    for(int iter = 1; iter<=opt_params.iterations_; iter++){
+    for(int iter = 1; iter<=opt_params.iterations_; iter++)
+    {
         auto iter_start_timing = std::chrono::steady_clock::now();
         
         auto viewpoint_stack = sceneGS->keyframes();
@@ -184,11 +186,18 @@ void train(
         // auto opacity = std::get<5>(render_pkg);
         // auto n_touched = std::get<6>(render_pkg);
 
+        // std::cout<<"render size"<<std::endl;
+        // std::cout<<rendered_image.sizes()<<std::endl;
+        // std::cout<<viewspace_point_tensor.sizes()<<std::endl;
+        // std::cout<<radii.sizes()<<std::endl;
         auto Ll1 = loss_utils::l1_loss(rendered_image, viewpoint_cam->original_image_);
         float lambda_dssim = opt_params.lambda_dssim_;
         auto loss = (1.0 - lambda_dssim) * Ll1;
         loss += lambda_dssim * (1.0 - loss_utils::ssim(rendered_image, viewpoint_cam->original_image_, torch::kCUDA));
+        
+        // std::cout<<"bw1 "<<loss.data()<<std::endl;
         loss.backward();
+        // std::cout<<"bw2 "<<loss.data()<<std::endl;
 
         torch::cuda::synchronize();
         auto iter_end_timing = std::chrono::steady_clock::now();
@@ -209,7 +218,8 @@ void train(
                 *modelGS,
                 *sceneGS,
                 pipe_params,
-                background_color
+                background_color,
+                false
             );
 
             // Densification
@@ -222,16 +232,16 @@ void train(
                 // std::cout<< "[debug output]addDensificationStats" << std::endl;
                 modelGS->addDensificationStats(viewspace_point_tensor, visibility_filter);
 
-                // std::cout<< "[debug output]if" << std::endl;
                 if ((iter > opt_params.densify_from_iter_) && (iter % opt_params.densification_interval_ == 0)) {
                     int size_threshold = (iter > opt_params.opacity_reset_interval_) ? 20 : 0;
+                    // std::cout<< "[debug output]densifyAndPrune" << std::endl;
                     modelGS->densifyAndPrune(opt_params.densify_grad_threshold_, 0.005, sceneGS->cameras_extent_, size_threshold);
                 }
 
                 if (opt_params.opacity_reset_interval_ && iter % opt_params.opacity_reset_interval_ == 0 || 
                     (model_params.white_background_ && iter == opt_params.densify_from_iter_)
                 ){
-                    std::cout<< "[debug output]modelGS->resetOpacity()" << std::endl;
+                    // std::cout<< "[debug output]modelGS->resetOpacity()" << std::endl;
                     modelGS->resetOpacity();
                 }
             }
@@ -245,6 +255,7 @@ void train(
                 // sceneGS->optimizer_->zero_grad();
             }
         }
+        // std::cout<<"iter "<< iter<<std::endl;
     }
 }
 

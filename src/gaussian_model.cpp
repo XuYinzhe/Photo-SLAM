@@ -729,6 +729,9 @@ void GaussianModel::densifyAndSplit(
         std::get<0>(torch::max(this->getScalingActivation(), /*dim=*/1)) > percentDense() * scene_extent
     );
 
+    // std::cout<<"densifyAndSplit "<<selected_pts_mask.sum()<<std::endl;
+    if(!torch::any(selected_pts_mask).item().toBool()) return;
+
     auto stds = this->getScalingActivation().index({selected_pts_mask}).repeat({N, 1});
     auto means = torch::zeros({stds.size(0), 3}, torch::TensorOptions().device(device_type_));
     auto samples = at::normal(means, stds);
@@ -771,6 +774,9 @@ void GaussianModel::densifyAndClone(
         selected_pts_mask,
         std::get<0>(torch::max(this->getScalingActivation(), /*dim=*/1)) <= percentDense() * scene_extent
     );
+
+    // std::cout<<"densifyAndClone "<<selected_pts_mask.sum()<<std::endl;
+    if(!torch::any(selected_pts_mask).item().toBool()) return;
 
     auto new_xyz = this->xyz_.index({selected_pts_mask});
     auto new_features_dc = this->features_dc_.index({selected_pts_mask});

@@ -64,6 +64,7 @@ public:
         GaussianModel& gaussians,
         GaussianScene& scene,
         GaussianPipelineParams& pipe,
-        torch::Tensor& background);
+        torch::Tensor& background,
+        bool flush = false);
 
 };

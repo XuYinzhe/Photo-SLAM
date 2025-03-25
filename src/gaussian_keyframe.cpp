@@ -54,10 +54,17 @@ void GaussianKeyframe::setPose(
     this->set_pose_ = true;
 }
 
-void GaussianKeyframe::setPose(std::vector<float> m){
-    m.push_back(0.f);m.push_back(0.f);m.push_back(0.f);m.push_back(1.f);
+void GaussianKeyframe::setPose(std::vector<float> m, bool isnerf = false){
     Eigen::Map<Eigen::Matrix4f> eigen_matrix(m.data());
     Eigen::Matrix4d eigen_matrix_d = eigen_matrix.cast<double>();
+    eigen_matrix_d = eigen_matrix_d.transpose().eval();
+
+    // Modify the camera axes to match COLMAP convention
+    // Flip Y and Z axes (c2w[:3, 1:3] *= -1 in Python)
+    if(isnerf){
+        eigen_matrix_d.col(1) *= -1.0;  // Flip Y axis
+        eigen_matrix_d.col(2) *= -1.0;  // Flip Z axis
+    }
 
     this->Tcw_ = Sophus::SE3d::fitToSE3(eigen_matrix_d);
     this->R_quaternion_ = this->Tcw_.unit_quaternion();
