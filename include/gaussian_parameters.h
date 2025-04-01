@@ -74,7 +74,15 @@ public:
         int opacity_reset_interval = 3000,
         int densify_from_iter = 500,
         int densify_until_iter = 15'000,
-        float densify_grad_threshold = 0.0002f);
+        float densify_grad_threshold = 0.0002f,
+        float cam_rotation_lr = 0.003f,
+        float cam_translation_lr = 0.001f,
+        float cam_linear_velocity_lr = 0.001f,
+        float cam_angular_velocity_lr = 0.0002f,
+        float cam_exposure_lr = 0.01f,
+        bool enable_optim_pose = true,
+        bool enable_optim_velocity = true,
+        bool enable_optim_exposure = true);
 
 public:
     int iterations_;
@@ -93,4 +101,14 @@ public:
     int densify_from_iter_;
     int densify_until_iter_;
     float densify_grad_threshold_;
+
+    float cam_rotation_lr_;
+    float cam_translation_lr_;
+    float cam_linear_velocity_lr_;
+    float cam_angular_velocity_lr_;
+    float cam_exposure_lr_;
+
+    bool enable_optim_pose_;
+    bool enable_optim_velocity_;
+    bool enable_optim_exposure_;
 };

@@ -99,13 +99,15 @@ int main(int argc, char* argv[]) {
     auto sceneGS = std::make_shared<GaussianScene>(model_params);
 
     std::cout<< "Load mapping points." <<std::endl;
+    std::cout<< "Points: " << vvfloatPLY.size() <<std::endl;
+    std::cout<< "Cams: " << vstrImageNamesRGB.size() <<std::endl;
     bool kfid_shuffled = false;
     for(size_t i=0; i<vvfloatPLY.size(); i++){
         auto& mp = vvfloatPLY[i];
         Point3D point3D;
         point3D.xyz_(0) = mp[0];
-        point3D.xyz_(1) = -mp[1];
-        point3D.xyz_(2) = -mp[2];
+        point3D.xyz_(1) = mp[1];
+        point3D.xyz_(2) = mp[2];
         point3D.color_(0) = mp[3]/255.f;
         point3D.color_(1) = mp[4]/255.f;
         point3D.color_(2) = mp[5]/255.f;
@@ -125,6 +127,9 @@ int main(int argc, char* argv[]) {
         kf->original_image_ = 
             tensor_utils::cvMat2TorchTensor_Float32(imgRGB, torch::kCUDA);
         kf->computeTransformTensors();
+        kf->enable_optim_exposure = false;
+        kf->enable_optim_pose = false;
+        kf->enable_optim_velocity = false;
         sceneGS->addKeyframe(kf, &kfid_shuffled);
     }
 
@@ -148,6 +153,7 @@ void train(
     float ema_loss_for_log = 0.0f;
 
     modelGS->trainingSetup(opt_params);
+    sceneGS->setupKeyframeOptimization(opt_params);
     // sceneGS->setupKeyframeOptimization(opt_params);
 
     std::vector<float> bg_color = {0.0f, 0.0f, 0.0f};
@@ -186,7 +192,12 @@ void train(
         // auto opacity = std::get<5>(render_pkg);
         // auto n_touched = std::get<6>(render_pkg);
 
-        // std::cout<<"render size"<<std::endl;
+        std::cout<<"render size"<<std::endl;
+        // std::cout<<visibility_filter.sizes()<<std::endl;
+        std::cout<<visibility_filter.sum()<<std::endl;
+        // std::cout<<radii.max()<<std::endl;
+        // std::cout<<radii.min()<<std::endl;
+        // std::cout<<radii.median()<<std::endl;
         // std::cout<<rendered_image.sizes()<<std::endl;
         // std::cout<<viewspace_point_tensor.sizes()<<std::endl;
         // std::cout<<radii.sizes()<<std::endl;
@@ -251,8 +262,8 @@ void train(
             if(iter < opt_params.iterations_){
                 modelGS->optimizer_->step();
                 modelGS->optimizer_->zero_grad();
-                // sceneGS->optimizer_->step();
-                // sceneGS->optimizer_->zero_grad();
+                sceneGS->optimizer_->step();
+                sceneGS->optimizer_->zero_grad();
             }
         }
         // std::cout<<"iter "<< iter<<std::endl;

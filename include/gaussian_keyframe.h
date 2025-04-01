@@ -33,13 +33,19 @@
 #include "graphics_utils.h"
 #include "tensor_utils.h"
 
-class GaussianKeyframe
+class GaussianKeyframe : public torch::nn::Module
 {
 public:
     GaussianKeyframe() {}
 
-    GaussianKeyframe(std::size_t fid, int creation_iter = 0)
-        : fid_(fid), creation_iter_(creation_iter) {}
+    GaussianKeyframe(std::size_t fid, int creation_iter = 0,
+        bool enable_pose = true,
+        bool enable_velocity = true,
+        bool enable_exposure = true)
+        : fid_(fid), creation_iter_(creation_iter),
+        enable_optim_pose(enable_pose),
+        enable_optim_velocity(enable_velocity),
+        enable_optim_exposure(enable_exposure) {}
 
     void setPose(
         const double qw,
@@ -80,6 +86,10 @@ public:
         torch::DeviceType device_type = torch::kCUDA);
 
     int getCurrentGausPyramidLevel();
+
+    void registerOptimParams();
+
+    void updatePose();
 
 public:
     std::size_t fid_;
@@ -125,9 +135,9 @@ public:
     Eigen::Vector3f trans_ = {0.0f, 0.0f, 0.0f};
     float scale_ = 1.0f;
 
-    torch::Tensor world_view_transform_;    ///< transform tensors
-    torch::Tensor projection_matrix_;       ///< transform tensors
-    torch::Tensor full_proj_transform_;     ///< transform tensors
+    torch::Tensor world_view_transform_;    ///< transform tensors Twc
+    torch::Tensor projection_matrix_;       ///< transform tensors J
+    torch::Tensor full_proj_transform_;     ///< transform tensors J * Twc
     torch::Tensor camera_center_;           ///< transform tensors
 
     std::vector<Point2D> points2D_;
@@ -135,4 +145,15 @@ public:
     std::vector<float> kps_point_local_;
 
     bool done_inactive_geo_densify_ = false;
+
+    bool enable_optim_pose;
+    bool enable_optim_velocity;
+    bool enable_optim_exposure;
+
+    torch::Tensor cam_rot_delta_;
+    torch::Tensor cam_trans_delta_;
+    torch::Tensor cam_ang_vel_;
+    torch::Tensor cam_lin_vel_;
+    torch::Tensor exposure_a_;
+    torch::Tensor exposure_b_;
 };

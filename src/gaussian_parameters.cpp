@@ -63,7 +63,15 @@ GaussianOptimizationParams::GaussianOptimizationParams(
     int opacity_reset_interval,
     int densify_from_iter,
     int densify_until_iter,
-    float densify_grad_threshold)
+    float densify_grad_threshold,
+    float cam_rotation_lr,
+    float cam_translation_lr,
+    float cam_linear_velocity_lr,
+    float cam_angular_velocity_lr,
+    float cam_exposure_lr,
+    bool enable_optim_pose,
+    bool enable_optim_velocity,
+    bool enable_optim_exposure)
     : iterations_(iterations),
       position_lr_init_(position_lr_init),
       position_lr_final_(position_lr_final),
@@ -79,5 +87,13 @@ GaussianOptimizationParams::GaussianOptimizationParams(
       opacity_reset_interval_(opacity_reset_interval),
       densify_from_iter_(densify_from_iter),
       densify_until_iter_(densify_until_iter),
-      densify_grad_threshold_(densify_grad_threshold)
+      densify_grad_threshold_(densify_grad_threshold),
+      cam_rotation_lr_(cam_rotation_lr),
+      cam_translation_lr_(cam_translation_lr),
+      cam_linear_velocity_lr_(cam_linear_velocity_lr),
+      cam_angular_velocity_lr_(cam_angular_velocity_lr),
+      cam_exposure_lr_(cam_exposure_lr),
+      enable_optim_pose_(enable_optim_pose),
+      enable_optim_velocity_(enable_optim_velocity),
+      enable_optim_exposure_(enable_optim_exposure)
 {}

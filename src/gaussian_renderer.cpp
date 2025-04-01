@@ -56,13 +56,21 @@ GaussianRenderer::render(
         image_width,
         tanfovx,
         tanfovy,
+        viewpoint_camera->intr_, // intrinsics fx fy cx cy
         bg_color,
         scaling_modifier,
         viewpoint_camera->world_view_transform_,
         viewpoint_camera->full_proj_transform_,
+        viewpoint_camera->projection_matrix_,
         pc->active_sh_degree_,
         viewpoint_camera->camera_center_,
-        false
+        0.f,                                        // rolling_shutter_time
+        0.03f,                                      // exposure_time
+        8,                                          // n_blur_samples
+        viewpoint_camera->enable_optim_pose,        // enable_optim_pose
+        viewpoint_camera->enable_optim_velocity,    // enable_optim_velocity
+        false,      // prefiltered
+        false       // debug
     );
 
     GaussianRasterizer rasterizer(raster_settings);
@@ -132,7 +140,11 @@ GaussianRenderer::render(
         colors_precomp,
         scales,
         rotations,
-        cov3D_precomp
+        cov3D_precomp,
+        viewpoint_camera->cam_rot_delta_,
+        viewpoint_camera->cam_trans_delta_,
+        viewpoint_camera->cam_lin_vel_,
+        viewpoint_camera->cam_ang_vel_
     );
     auto rendered_image = std::get<0>(rasterizer_result);
     auto radii = std::get<1>(rasterizer_result);

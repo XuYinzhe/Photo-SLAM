@@ -22,7 +22,7 @@ GaussianRasterizer::markVisibleGaussians(
     // Mark visible points (based on frustum culling for camera) with a boolean
     torch::NoGradGuard no_grad;
     auto raster_settings = this->raster_settings_;
-    return markVisible(positions, raster_settings.viewmatrix_, raster_settings.projmatrix_);
+    return markVisible(positions, raster_settings.viewmatrix_, raster_settings.full_projmatrix_);
 }
 
 torch::autograd::tensor_list
@@ -36,6 +36,10 @@ GaussianRasterizerFunction::forward(
     torch::Tensor scales,
     torch::Tensor rotations,
     torch::Tensor cov3Ds_precomp,
+    torch::Tensor theta,    // cam_rot_delta_
+    torch::Tensor rho,      // cam_trans_delta_
+    torch::Tensor nu,       // cam_lin_vel_delta_
+    torch::Tensor omega,    // cam_ang_vel_delta_
     GaussianRasterizationSettings raster_settings)
     // torch::Tensor bg,
     // float scale_modifier,
@@ -60,23 +64,35 @@ GaussianRasterizerFunction::forward(
         raster_settings.scale_modifier_,
         cov3Ds_precomp,
         raster_settings.viewmatrix_,
-        raster_settings.projmatrix_,
+        raster_settings.full_projmatrix_,   // !!! projmatrix_ (J*W) -> full_projmatrix_ (J*W)
+        raster_settings.projmatrix_,        // !!! newly added () -> projmatrix_ (J)
+        nu, omega,
+        raster_settings.rolling_shutter_time_,
+        raster_settings.exposure_time_,
+        raster_settings.n_blur_samples_,
         raster_settings.tanfovx_,
         raster_settings.tanfovy_,
+        raster_settings.cx_, raster_settings.cy_,
         raster_settings.image_height_,
         raster_settings.image_width_,
         sh,
         raster_settings.sh_degree_,
         raster_settings.campos_,
-        raster_settings.prefiltered_
+        raster_settings.enable_optim_pose_,
+        raster_settings.enable_optim_velocity_,
+        raster_settings.prefiltered_,
+        raster_settings.debug_
     );
 
     auto num_rendered = std::get<0>(rasterization_result);
     auto color = std::get<1>(rasterization_result);
     auto radii = std::get<2>(rasterization_result);
-    auto geomBuffer = std::get<3>(rasterization_result);
-    auto binningBuffer = std::get<4>(rasterization_result);
-    auto imgBuffer = std::get<5>(rasterization_result);
+    auto depth = std::get<3>(rasterization_result);
+    auto opaticy = std::get<4>(rasterization_result);
+    auto n_touched = std::get<5>(rasterization_result);
+    auto geomBuffer = std::get<6>(rasterization_result);
+    auto binningBuffer = std::get<7>(rasterization_result);
+    auto imgBuffer = std::get<8>(rasterization_result);
 
     // Keep relevant tensors for backward
     ctx->saved_data["num_rendered"] = num_rendered;
@@ -84,9 +100,15 @@ GaussianRasterizerFunction::forward(
     ctx->saved_data["tanfovx"] = raster_settings.tanfovx_;
     ctx->saved_data["tanfovy"] = raster_settings.tanfovy_;
     ctx->saved_data["sh_degree"] = raster_settings.sh_degree_;
+    ctx->saved_data["deblur_rs_time"] = raster_settings.rolling_shutter_time_;
+    ctx->saved_data["deblur_mb_time"] = raster_settings.exposure_time_;
+    ctx->saved_data["deblur_samples"] = raster_settings.n_blur_samples_;
+    ctx->saved_data["enable_optim_pose"] = raster_settings.enable_optim_pose_;
+    ctx->saved_data["enable_optim_velocity"] = raster_settings.enable_optim_velocity_;
+    ctx->saved_data["debug"] = raster_settings.debug_;
     ctx->save_for_backward({raster_settings.bg_,
                             raster_settings.viewmatrix_,
-                            raster_settings.projmatrix_,
+                            raster_settings.full_projmatrix_,
                             raster_settings.campos_,
                             colors_precomp,
                             means3D,
@@ -97,9 +119,12 @@ GaussianRasterizerFunction::forward(
                             sh,
                             geomBuffer,
                             binningBuffer,
-                            imgBuffer});
+                            imgBuffer,
+                            raster_settings.projmatrix_,
+                            nu, omega
+                            });
 
-    return {color, radii};
+    return {color, radii, depth, opaticy, n_touched};
 }
 
 torch::autograd::tensor_list
@@ -113,12 +138,18 @@ GaussianRasterizerFunction::backward(
     auto tanfovx = static_cast<float>(ctx->saved_data["tanfovx"].toDouble());
     auto tanfovy = static_cast<float>(ctx->saved_data["tanfovy"].toDouble());
     auto sh_degree = ctx->saved_data["sh_degree"].toInt();
+    auto deblur_rs_time = static_cast<float>(ctx->saved_data["deblur_rs_time"].toDouble());
+    auto deblur_mb_time = static_cast<float>(ctx->saved_data["deblur_mb_time"].toDouble());
+    auto deblur_samples = ctx->saved_data["deblur_samples"].toInt();
+    auto enable_optim_pose = ctx->saved_data["enable_optim_pose"].toBool();
+    auto enable_optim_velocity = ctx->saved_data["enable_optim_velocity"].toBool();
+    auto debug = ctx->saved_data["debug"].toBool();
 
     auto saved = ctx->get_saved_variables();
 
     auto bg = saved[0];
     auto viewmatrix = saved[1];
-    auto projmatrix = saved[2];
+    auto fullprojmatrix = saved[2]; // ! J*W
     auto campos = saved[3];
     auto colors_precomp = saved[4];
     auto means3D = saved[5];
@@ -130,9 +161,13 @@ GaussianRasterizerFunction::backward(
     auto geomBuffer = saved[11];
     auto binningBuffer = saved[12];
     auto imgBuffer = saved[13];
+    auto projmatrix = saved[14]; // ! J
+    auto nu = saved[15];
+    auto omega = saved[16];
 
     // Compute gradients for relevant tensors by invoking backward method
     auto grad_out_color = grad_outputs[0];
+    auto grad_out_depth = grad_outputs[2];
     auto rasterization_backward_result = RasterizeGaussiansBackwardCUDA(
         bg,
         means3D,
@@ -143,18 +178,45 @@ GaussianRasterizerFunction::backward(
         scale_modifier,
         cov3Ds_precomp,
         viewmatrix,
+        fullprojmatrix,
         projmatrix,
+        nu, omega,
+        deblur_rs_time,
+        deblur_mb_time,
+        deblur_samples,
         tanfovx,
         tanfovy,
         grad_out_color,
+        grad_out_depth,
         sh,
         sh_degree,
         campos,
         geomBuffer,
         num_rendered,
         binningBuffer,
-        imgBuffer
+        imgBuffer,
+        enable_optim_pose,
+        enable_optim_velocity,
+        debug
     );
+
+    // std::cout<<"grads sizes"<<std::endl;
+    // std::cout<<(std::get<3>(rasterization_backward_result)).sizes()<<std::endl;
+    // std::cout<<(std::get<0>(rasterization_backward_result)).sizes()<<std::endl;
+    // std::cout<<(std::get<5>(rasterization_backward_result)).sizes()<<std::endl;
+    // std::cout<<(std::get<1>(rasterization_backward_result)).sizes()<<std::endl;
+    // std::cout<<(std::get<2>(rasterization_backward_result)).sizes()<<std::endl;
+    // std::cout<<(std::get<6>(rasterization_backward_result)).sizes()<<std::endl;
+    // std::cout<<(std::get<7>(rasterization_backward_result)).sizes()<<std::endl;
+    // std::cout<<(std::get<4>(rasterization_backward_result)).sizes()<<std::endl;
+
+    auto grad_tau = std::get<8>(rasterization_backward_result);
+    grad_tau = torch::sum(grad_tau.view({-1, 6}), 0);
+    auto grad_rho = grad_tau.slice(0, 0, 3).view({1, -1});
+    auto grad_theta = grad_tau.slice(0, 3, 6).view({1, -1});
+
+    auto grad_nu = std::get<9>(rasterization_backward_result);
+    auto grad_omega = std::get<10>(rasterization_backward_result);
 
     return {
         std::get<3>(rasterization_backward_result)/*dL_dmeans3D*/,
@@ -165,6 +227,10 @@ GaussianRasterizerFunction::backward(
         std::get<6>(rasterization_backward_result)/*dL_dscales*/,
         std::get<7>(rasterization_backward_result)/*dL_drotations*/,
         std::get<4>(rasterization_backward_result)/*dL_dcov3D*/,
+        grad_theta,
+        grad_rho,
+        grad_nu, 
+        grad_omega,
         torch::Tensor()//,
         // torch::Tensor(),
         // torch::Tensor(),
@@ -179,7 +245,12 @@ GaussianRasterizerFunction::backward(
     };
 }
 
-std::tuple<torch::Tensor, torch::Tensor>
+std::tuple<
+    torch::Tensor,  // color
+    torch::Tensor,  // radii
+    torch::Tensor,  // depth
+    torch::Tensor,  // opaticy
+    torch::Tensor>  // n_touched
 GaussianRasterizer::forward(
     torch::Tensor means3D,
     torch::Tensor means2D,
@@ -193,7 +264,12 @@ GaussianRasterizer::forward(
     torch::Tensor colors_precomp,
     torch::Tensor scales,
     torch::Tensor rotations,
-    torch::Tensor cov3D_precomp)
+    torch::Tensor cov3D_precomp,
+    torch::Tensor theta,    // cam_rot_delta_
+    torch::Tensor rho,      // cam_trans_delta_
+    torch::Tensor nu,       // cam_lin_vel_delta_
+    torch::Tensor omega     // cam_ang_vel_delta_
+    )
 
 {
     auto raster_settings = this->raster_settings_;
@@ -227,8 +303,12 @@ GaussianRasterizer::forward(
         scales,
         rotations,
         cov3D_precomp,
+        theta,  // cam_rot_delta_    
+        rho,    // cam_trans_delta_    
+        nu,     // cam_lin_vel_delta_    
+        omega,  // cam_ang_vel_delta_     
         raster_settings
     );
 
-    return std::make_tuple(result[0]/*color*/, result[1]/*radii*/);
+    return std::make_tuple(result[0]/*color*/, result[1]/*radii*/, result[2], result[3], result[4]);
 }

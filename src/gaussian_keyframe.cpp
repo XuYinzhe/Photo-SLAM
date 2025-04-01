@@ -62,14 +62,21 @@ void GaussianKeyframe::setPose(std::vector<float> m, bool isnerf = false){
     // Modify the camera axes to match COLMAP convention
     // Flip Y and Z axes (c2w[:3, 1:3] *= -1 in Python)
     if(isnerf){
-        eigen_matrix_d.col(1) *= -1.0;  // Flip Y axis
-        eigen_matrix_d.col(2) *= -1.0;  // Flip Z axis
+        // eigen_matrix_d.col(1) *= -1.0;
+        // eigen_matrix_d.col(2) *= -1.0;
+        eigen_matrix_d.block(0,1,3,2) *= -1.0;
     }
 
-    this->Tcw_ = Sophus::SE3d::fitToSE3(eigen_matrix_d);
-    this->R_quaternion_ = this->Tcw_.unit_quaternion();
+    // this->Tcw_ = Sophus::SE3d::fitToSE3(eigen_matrix_d);
+    // this->R_quaternion_ = this->Tcw_.unit_quaternion();
+    // this->R_quaternion_.normalize();
+    // this->t_ = this->Tcw_.translation();
+
+    auto Twc = Sophus::SE3d::fitToSE3(eigen_matrix_d.inverse());
+    this->R_quaternion_ = Twc.unit_quaternion();
     this->R_quaternion_.normalize();
-    this->t_ = this->Tcw_.translation();
+    this->t_ = Twc.translation();
+    this->Tcw_ = Sophus::SE3d(this->R_quaternion_, this->t_);
 
     this->set_pose_ = true;
 }
@@ -233,4 +240,70 @@ int GaussianKeyframe::getCurrentGausPyramidLevel()
     }
     // If all sub levels has been used up
     return num_gaus_pyramid_sub_levels_;
+}
+
+void GaussianKeyframe::registerOptimParams(){
+
+    if (!this->cam_rot_delta_.defined())
+        this->cam_rot_delta_ = torch::zeros({3}, torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA));
+    if (!this->cam_trans_delta_.defined())
+        this->cam_trans_delta_ = torch::zeros({3}, torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA));
+    if (!this->cam_ang_vel_.defined())
+        this->cam_ang_vel_ = torch::zeros({3}, torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA));
+    if (!this->cam_lin_vel_.defined())
+        this->cam_lin_vel_ = torch::zeros({3}, torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA));
+    if (!this->exposure_a_.defined())
+        this->exposure_a_ = torch::zeros({1}, torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA));
+    if (!this->exposure_b_.defined())
+        this->exposure_b_ = torch::zeros({1}, torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA));
+
+    if (this->enable_optim_pose) {
+        this->cam_rot_delta_ = register_parameter(
+            "cam_rot_delta_" + std::to_string(this->fid_),
+            this->cam_rot_delta_.requires_grad_(true));
+        this->cam_trans_delta_ = register_parameter(
+            "cam_trans_delta_" + std::to_string(this->fid_),
+            this->cam_trans_delta_.requires_grad_(true));
+    }
+    if (this->enable_optim_velocity) {
+        this->cam_ang_vel_ = register_parameter(
+            "cam_ang_vel_" + std::to_string(this->fid_),
+            this->cam_ang_vel_.requires_grad_(true));
+        this->cam_lin_vel_ = register_parameter(
+            "cam_lin_vel_" + std::to_string(this->fid_),
+            this->cam_lin_vel_.requires_grad_(true));
+    }
+    if (this->enable_optim_exposure) {
+        this->exposure_a_ = register_parameter(
+            "exposure_a_" + std::to_string(this->fid_),
+            this->exposure_a_.requires_grad_(true));
+        this->exposure_b_ = register_parameter(
+            "exposure_b_" + std::to_string(this->fid_),
+            this->exposure_b_.requires_grad_(true));
+    }
+}
+
+void GaussianKeyframe::updatePose(){
+    if (!this->enable_optim_pose||!this->set_pose_) return;
+
+    // Convert Lie algebra deltas to Sophus's SE3
+    Eigen::Vector3d tau_trans = Eigen::Vector3d(
+            this->cam_trans_delta_.cpu().data_ptr<double>());
+    Eigen::Vector3d tau_rot = Eigen::Vector3d(
+            this->cam_rot_delta_.cpu().data_ptr<double>());
+    Eigen::Matrix<double, 6, 1> tau;
+    tau << tau_trans, tau_rot;
+    Sophus::SE3d delta_T = Sophus::SE3d::exp(tau);
+    this->Tcw_ = delta_T * this->Tcw_;  // Update camera pose
+    // Reset deltas
+    this->cam_rot_delta_.data().zero_();
+    this->cam_trans_delta_.data().zero_();
+
+    // update q,t
+    // auto Twc = this->Tcw_.inverse();
+    this->R_quaternion_ = this->Tcw_.unit_quaternion();
+    this->R_quaternion_.normalize();
+    this->t_ = this->Tcw_.translation();
+    // update other matrix
+    this->computeTransformTensors();
 }

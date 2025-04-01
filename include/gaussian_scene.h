@@ -65,6 +65,8 @@ public:
                std::map<std::size_t, std::shared_ptr<GaussianKeyframe>>>
         splitTrainAndTestKeyframes(const float test_ratio);
 
+    void setupKeyframeOptimization(const GaussianOptimizationParams& opt_params);
+
 public:
     float cameras_extent_; ///< scene_info.nerf_normalization["radius"]
 
@@ -73,6 +75,15 @@ public:
     std::map<camera_id_t, Camera> cameras_;
     std::map<std::size_t, std::shared_ptr<GaussianKeyframe>> keyframes_;
     std::map<point3D_id_t, Point3D> cached_point_cloud_;
+
+    std::shared_ptr<torch::optim::Adam> optimizer_;
+    bool optimizer_initialized_ = false;
+
+    float init_cam_rotation_lr_;
+    float init_cam_translation_lr_;
+    float init_cam_linear_velocity_lr_;
+    float init_cam_angular_velocity_lr_;
+    float init_cam_exposure_lr_;
 
 protected:
     std::mutex mutex_kfs_;

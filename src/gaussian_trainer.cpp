@@ -145,12 +145,22 @@ void GaussianTrainer::trainingReport(
     GaussianModel& gaussians,
     GaussianScene& scene,
     GaussianPipelineParams& pipe,
-    torch::Tensor& background)
+    torch::Tensor& background,
+    bool flush)
 {
-    std::cout << std::fixed << std::setprecision(8)
+    if(flush)
+       std::cout << std::fixed << std::setprecision(8)
               << "Training iteration " << iteration << "/" << num_iterations
               << ", time elapsed:" << elapsed_time / 1000.0 << "s"
               << ", ema_loss:" << ema_loss_for_log
               << ", num_points:" << gaussians.xyz_.size(0)
-              << std::endl;
+              << "\r"
+              << std::flush; 
+    else
+        std::cout << std::fixed << std::setprecision(8)
+                << "Training iteration " << iteration << "/" << num_iterations
+                << ", time elapsed:" << elapsed_time / 1000.0 << "s"
+                << ", ema_loss:" << ema_loss_for_log
+                << ", num_points:" << gaussians.xyz_.size(0)
+                << std::endl;
 }

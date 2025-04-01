@@ -44,8 +44,33 @@ Camera& GaussianScene::getCamera(camera_id_t cameraId)
 void GaussianScene::addKeyframe(std::shared_ptr<GaussianKeyframe> new_kf, bool* shuffled)
 {
     std::unique_lock<std::mutex> lock_kfs(this->mutex_kfs_);
+    new_kf->registerOptimParams();
     this->keyframes_.emplace(new_kf->fid_, new_kf);
     *shuffled = false;
+
+    if(!this->optimizer_initialized_)return;
+
+    if(new_kf->enable_optim_pose){
+        std::vector<torch::Tensor> temp_param1 = {new_kf->cam_rot_delta_};
+        std::vector<torch::Tensor> temp_param2 = {new_kf->cam_trans_delta_};
+        this->optimizer_->add_param_group(temp_param1);
+        optimizer_->param_groups().back().options().set_lr(init_cam_rotation_lr_);
+        this->optimizer_->add_param_group(temp_param2);
+        optimizer_->param_groups().back().options().set_lr(init_cam_translation_lr_);
+    }
+    if(new_kf->enable_optim_velocity){
+        std::vector<torch::Tensor> temp_param1 = {new_kf->cam_lin_vel_};
+        std::vector<torch::Tensor> temp_param2 = {new_kf->cam_ang_vel_};
+        this->optimizer_->add_param_group(temp_param1);
+        optimizer_->param_groups().back().options().set_lr(init_cam_linear_velocity_lr_);
+        this->optimizer_->add_param_group(temp_param2);
+        optimizer_->param_groups().back().options().set_lr(init_cam_angular_velocity_lr_);
+    }
+    if(new_kf->enable_optim_exposure){
+        std::vector<torch::Tensor> temp_param = {new_kf->exposure_a_, new_kf->exposure_b_};
+        this->optimizer_->add_param_group(temp_param);
+        optimizer_->param_groups().back().options().set_lr(init_cam_exposure_lr_);
+    }
 }
 
 std::shared_ptr<GaussianKeyframe>
@@ -149,4 +174,44 @@ GaussianScene::getNerfppNorm()
     Eigen::Vector3f translate = -avg_cam_center;
 
     return std::make_tuple(translate, radius);
+}
+
+void GaussianScene::setupKeyframeOptimization(const GaussianOptimizationParams& opt_params) {
+    // optimizer_.reset(nullptr);
+    this->init_cam_rotation_lr_ = opt_params.cam_rotation_lr_;
+    this->init_cam_translation_lr_ = opt_params.cam_translation_lr_;
+    this->init_cam_linear_velocity_lr_ = opt_params.cam_linear_velocity_lr_;
+    this->init_cam_angular_velocity_lr_ = opt_params.cam_angular_velocity_lr_;
+    this->init_cam_exposure_lr_ = opt_params.cam_exposure_lr_;
+
+    std::vector<torch::Tensor> pose_rot_params, pose_trans_params, vel_lin_params, vel_ang_params, exposure_params;
+
+    for (auto& kfit : this->keyframes_) {
+        auto& keyframe = kfit.second;
+        keyframe->registerOptimParams();
+
+        if (keyframe->enable_optim_pose) {
+            pose_rot_params.push_back(keyframe->cam_rot_delta_);
+            pose_trans_params.push_back(keyframe->cam_trans_delta_);
+        }
+        if (keyframe->enable_optim_velocity) {
+            vel_lin_params.push_back(keyframe->cam_lin_vel_);
+            vel_ang_params.push_back(keyframe->cam_ang_vel_);
+        }
+        if (keyframe->enable_optim_exposure) {
+            exposure_params.push_back(keyframe->exposure_a_);
+            exposure_params.push_back(keyframe->exposure_b_);
+        }
+    }
+
+    this->optimizer_.reset(new torch::optim::Adam(pose_rot_params, torch::optim::AdamOptions(opt_params.cam_rotation_lr_)));
+    this->optimizer_->add_param_group(pose_trans_params);
+    this->optimizer_->param_groups().back().options().set_lr(opt_params.cam_translation_lr_);
+    this->optimizer_->add_param_group(vel_lin_params);
+    this->optimizer_->param_groups().back().options().set_lr(opt_params.cam_linear_velocity_lr_);
+    this->optimizer_->add_param_group(vel_ang_params);
+    this->optimizer_->param_groups().back().options().set_lr(opt_params.cam_angular_velocity_lr_);
+    this->optimizer_->add_param_group(exposure_params);
+    this->optimizer_->param_groups().back().options().set_lr(opt_params.cam_exposure_lr_);
+    this->optimizer_initialized_ = true;
 }
