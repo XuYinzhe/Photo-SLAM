@@ -54,7 +54,7 @@ uint32_t getHigherMsb(uint32_t n)
 __global__ void checkFrustum(int P,
 	const float* orig_points,
 	const float* viewmatrix,
-	const float* projmatrix,
+	const float* fullprojmatrix,
 	bool* present)
 {
 	auto idx = cg::this_grid().thread_rank();
@@ -62,7 +62,7 @@ __global__ void checkFrustum(int P,
 		return;
 
 	float3 p_view;
-	present[idx] = in_frustum(idx, orig_points, viewmatrix, projmatrix, false, p_view);
+	present[idx] = in_frustum(idx, orig_points, viewmatrix, fullprojmatrix, false, p_view);
 }
 
 // Generates one key/value pair for all Gaussian / tile overlaps. 
@@ -142,13 +142,13 @@ void CudaRasterizer::Rasterizer::markVisible(
 	int P,
 	float* means3D,
 	float* viewmatrix,
-	float* projmatrix,
+	float* fullprojmatrix,
 	bool* present)
 {
 	checkFrustum << <(P + 255) / 256, 256 >> > (
 		P,
 		means3D,
-		viewmatrix, projmatrix,
+		viewmatrix, fullprojmatrix,
 		present);
 }
 
@@ -211,12 +211,24 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* rotations,
 	const float* cov3D_precomp,
 	const float* viewmatrix,
-	const float* projmatrix,
+	const float* fullprojmatrix,
 	const float* cam_pos,
+	const float* deblur_nu,				// cam_lin_vel_
+	const float* deblur_omega,			// cam_ang_vel_
+	const float deblur_rs_time,			// rolling_shutter_time_
+	const float deblur_mb_time,			// exposure_time_
+	const unsigned deblur_samples,		// n_blur_samples_
 	const float tan_fovx, float tan_fovy,
+	const float cx, const float cy,
 	const bool prefiltered,
+	const bool enable_optim_pose,
+	const bool enable_optim_velocity,
 	float* out_color,
-	int* radii)
+	float* out_depth,
+	float* out_opacity,
+	int* radii,
+	int* n_touched,
+	bool debug)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -255,7 +267,7 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.clamped,
 		cov3D_precomp,
 		colors_precomp,
-		viewmatrix, projmatrix,
+		viewmatrix, fullprojmatrix,
 		(glm::vec3*)cam_pos,
 		width, height,
 		focal_x, focal_y,
@@ -349,23 +361,38 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* rotations,
 	const float* cov3D_precomp,
 	const float* viewmatrix,
+	const float* fullprojmatrix,
 	const float* projmatrix,
 	const float* campos,
 	const float tan_fovx, float tan_fovy,
 	const int* radii,
+	const float* deblur_nu,				// cam_lin_vel_
+	const float* deblur_omega,			// cam_ang_vel_
+	const float deblur_rs_time,			// rolling_shutter_time_
+	const float deblur_mb_time,			// exposure_time_
+	const unsigned deblur_samples,		// n_blur_samples_
+	const bool enable_optim_pose,
+	const bool enable_optim_velocity,
 	char* geom_buffer,
 	char* binning_buffer,
 	char* img_buffer,
-	const float* dL_dpix,
+	const float* dL_dpix,		// dL_dout_color
+	const float* dL_dpix_depth,	// dL_dout_depth
 	float* dL_dmean2D,
 	float* dL_dconic,
 	float* dL_dopacity,
 	float* dL_dcolor,
+	float* dL_ddepths,
+	float* dL_dpixvels,
 	float* dL_dmean3D,
 	float* dL_dcov3D,
 	float* dL_dsh,
 	float* dL_dscale,
-	float* dL_drot)
+	float* dL_drot,
+	float* dL_dtau,
+	float* dL_dnu,
+	float* dL_domega,
+	bool debug)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
@@ -418,7 +445,7 @@ void CudaRasterizer::Rasterizer::backward(
 		scale_modifier,
 		cov3D_ptr,
 		viewmatrix,
-		projmatrix,
+		fullprojmatrix,
 		focal_x, focal_y,
 		tan_fovx, tan_fovy,
 		(glm::vec3*)campos,

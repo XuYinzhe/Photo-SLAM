@@ -286,7 +286,7 @@ void GaussianKeyframe::registerOptimParams(){
 void GaussianKeyframe::updatePose(){
     if (!this->enable_optim_pose||!this->set_pose_) return;
 
-    // Convert Lie algebra deltas to Sophus's SE3
+    // Convert Lie algebra deltas to SE3
     Eigen::Vector3d tau_trans = Eigen::Vector3d(
             this->cam_trans_delta_.cpu().data_ptr<double>());
     Eigen::Vector3d tau_rot = Eigen::Vector3d(

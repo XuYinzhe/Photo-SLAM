@@ -192,9 +192,9 @@ void train(
         // auto opacity = std::get<5>(render_pkg);
         // auto n_touched = std::get<6>(render_pkg);
 
-        std::cout<<"render size"<<std::endl;
+        // std::cout<<"render size"<<std::endl;
         // std::cout<<visibility_filter.sizes()<<std::endl;
-        std::cout<<visibility_filter.sum()<<std::endl;
+        // std::cout<<visibility_filter.sum()<<std::endl;
         // std::cout<<radii.max()<<std::endl;
         // std::cout<<radii.min()<<std::endl;
         // std::cout<<radii.median()<<std::endl;
