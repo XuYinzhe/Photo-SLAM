@@ -1,3 +1,7 @@
+data
+./results
+*.txt
+
 # Prerequisites
 *.d
 
