@@ -36,6 +36,8 @@ GaussianRasterizerFunction::forward(
     torch::Tensor scales,
     torch::Tensor rotations,
     torch::Tensor cov3Ds_precomp,
+    torch::Tensor theta,
+    torch::Tensor rho,
     GaussianRasterizationSettings raster_settings)
     // torch::Tensor bg,
     // float scale_modifier,
@@ -61,6 +63,7 @@ GaussianRasterizerFunction::forward(
         cov3Ds_precomp,
         raster_settings.viewmatrix_,
         raster_settings.projmatrix_,
+        raster_settings.projmatrix_raw_,
         raster_settings.tanfovx_,
         raster_settings.tanfovy_,
         raster_settings.image_height_,
@@ -68,7 +71,8 @@ GaussianRasterizerFunction::forward(
         sh,
         raster_settings.sh_degree_,
         raster_settings.campos_,
-        raster_settings.prefiltered_
+        raster_settings.prefiltered_,
+        raster_settings.debug_
     );
 
     auto num_rendered = std::get<0>(rasterization_result);
@@ -77,6 +81,9 @@ GaussianRasterizerFunction::forward(
     auto geomBuffer = std::get<3>(rasterization_result);
     auto binningBuffer = std::get<4>(rasterization_result);
     auto imgBuffer = std::get<5>(rasterization_result);
+    auto out_depth =  std::get<6>(rasterization_result);
+    auto out_opaticy =  std::get<7>(rasterization_result);
+    auto n_touched =  std::get<8>(rasterization_result);
 
     // Keep relevant tensors for backward
     ctx->saved_data["num_rendered"] = num_rendered;
@@ -84,9 +91,11 @@ GaussianRasterizerFunction::forward(
     ctx->saved_data["tanfovx"] = raster_settings.tanfovx_;
     ctx->saved_data["tanfovy"] = raster_settings.tanfovy_;
     ctx->saved_data["sh_degree"] = raster_settings.sh_degree_;
+    ctx->saved_data["debug"] = raster_settings.debug_;
     ctx->save_for_backward({raster_settings.bg_,
                             raster_settings.viewmatrix_,
                             raster_settings.projmatrix_,
+                            raster_settings.projmatrix_raw_,
                             raster_settings.campos_,
                             colors_precomp,
                             means3D,
@@ -99,7 +108,7 @@ GaussianRasterizerFunction::forward(
                             binningBuffer,
                             imgBuffer});
 
-    return {color, radii};
+    return {color, radii, out_depth, out_opaticy, n_touched};
 }
 
 torch::autograd::tensor_list
@@ -113,26 +122,29 @@ GaussianRasterizerFunction::backward(
     auto tanfovx = static_cast<float>(ctx->saved_data["tanfovx"].toDouble());
     auto tanfovy = static_cast<float>(ctx->saved_data["tanfovy"].toDouble());
     auto sh_degree = ctx->saved_data["sh_degree"].toInt();
+    auto debug = ctx->saved_data["debug"].toBool();
 
     auto saved = ctx->get_saved_variables();
 
     auto bg = saved[0];
     auto viewmatrix = saved[1];
     auto projmatrix = saved[2];
-    auto campos = saved[3];
-    auto colors_precomp = saved[4];
-    auto means3D = saved[5];
-    auto scales = saved[6];
-    auto rotations = saved[7];
-    auto cov3Ds_precomp = saved[8];
-    auto radii = saved[9];
-    auto sh = saved[10];
-    auto geomBuffer = saved[11];
-    auto binningBuffer = saved[12];
-    auto imgBuffer = saved[13];
+    auto projmatrix_raw = saved[3];
+    auto campos = saved[4];
+    auto colors_precomp = saved[5];
+    auto means3D = saved[6];
+    auto scales = saved[7];
+    auto rotations = saved[8];
+    auto cov3Ds_precomp = saved[9];
+    auto radii = saved[10];
+    auto sh = saved[11];
+    auto geomBuffer = saved[12];
+    auto binningBuffer = saved[13];
+    auto imgBuffer = saved[14];
 
     // Compute gradients for relevant tensors by invoking backward method
     auto grad_out_color = grad_outputs[0];
+    auto grad_out_depth = grad_outputs[2];
     auto rasterization_backward_result = RasterizeGaussiansBackwardCUDA(
         bg,
         means3D,
@@ -144,17 +156,25 @@ GaussianRasterizerFunction::backward(
         cov3Ds_precomp,
         viewmatrix,
         projmatrix,
+        projmatrix_raw,
         tanfovx,
         tanfovy,
         grad_out_color,
+        grad_out_depth,
         sh,
         sh_degree,
         campos,
         geomBuffer,
         num_rendered,
         binningBuffer,
-        imgBuffer
+        imgBuffer,
+        debug
     );
+
+    auto dL_dtau = std::get<8>(rasterization_backward_result);
+    auto grad_tau = dL_dtau.view({-1, 6}).sum(/*dim=*/0);        // shape [6]
+    auto grad_rho = grad_tau.index({torch::indexing::Slice(0, 3)}).view({1, -1}); // shape [1, 3]
+    auto grad_theta = grad_tau.index({torch::indexing::Slice(3, torch::indexing::None)}).view({1, -1}); // shape [1, 3]
 
     return {
         std::get<3>(rasterization_backward_result)/*dL_dmeans3D*/,
@@ -165,6 +185,8 @@ GaussianRasterizerFunction::backward(
         std::get<6>(rasterization_backward_result)/*dL_dscales*/,
         std::get<7>(rasterization_backward_result)/*dL_drotations*/,
         std::get<4>(rasterization_backward_result)/*dL_dcov3D*/,
+        grad_theta,
+        grad_rho,
         torch::Tensor()//,
         // torch::Tensor(),
         // torch::Tensor(),
@@ -179,7 +201,7 @@ GaussianRasterizerFunction::backward(
     };
 }
 
-std::tuple<torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 GaussianRasterizer::forward(
     torch::Tensor means3D,
     torch::Tensor means2D,
@@ -193,7 +215,9 @@ GaussianRasterizer::forward(
     torch::Tensor colors_precomp,
     torch::Tensor scales,
     torch::Tensor rotations,
-    torch::Tensor cov3D_precomp)
+    torch::Tensor cov3D_precomp,
+    torch::Tensor theta,
+    torch::Tensor rho)
 
 {
     auto raster_settings = this->raster_settings_;
@@ -227,8 +251,16 @@ GaussianRasterizer::forward(
         scales,
         rotations,
         cov3D_precomp,
+        theta,
+        rho,
         raster_settings
     );
 
-    return std::make_tuple(result[0]/*color*/, result[1]/*radii*/);
+    return std::make_tuple(
+        result[0]/*color*/, 
+        result[1]/*radii*/,
+        result[2]/*out_depth*/, 
+        result[3]/*out_opaticy*/,
+        result[4]/*n_touched*/
+    );
 }

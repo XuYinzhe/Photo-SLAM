@@ -24,6 +24,8 @@
 #include <opencv2/cudaimgproc.hpp>
 #include <torch/torch.h>
 
+#include "ORB-SLAM3/Thirdparty/Sophus/sophus/se3.hpp"
+
 namespace tensor_utils
 {
 
@@ -191,6 +193,31 @@ inline torch::Tensor EigenMatrix2TorchTensor(
 
     tensor = tensor.to(device_type);
     return tensor;
+}
+
+inline Sophus::SE3f TensorTransformation2SE3f(const torch::Tensor& T) {
+    torch::Tensor temp = T.cpu().contiguous();
+    const float* data_ptr = temp.data_ptr<float>();
+    
+    if (temp.numel() != 16) {
+        std::cerr << "[error] Tensor must have 16 elements for 4x4 matrix in `TensorTransformation2SE3f`" << std::endl;
+        return Sophus::SE3f(); 
+    }
+
+    Eigen::Map<const Eigen::Matrix4f> Te(data_ptr);  // Use default column-major mapping
+    Eigen::Matrix3f R = Te.block<3,3>(0,0);
+    Eigen::Vector3f t = Te.block<3,1>(0,3);
+    
+    Eigen::Quaternionf q(R);
+
+    if (q.squaredNorm() < 1e-10f) {
+        q = Eigen::Quaternionf::Identity();
+        std::cout << "[warning] Invalid quaternion in `TensorTransformation2SE3f`. Reset to identity." << std::endl;
+    } else {
+        q.normalize();
+    }
+    
+    return Sophus::SE3f(q, t);
 }
 
 }

@@ -64,6 +64,46 @@ Sophus::SE3f GaussianKeyframe::getPosef()
     return this->Tcw_.cast<float>();
 }
 
+bool GaussianKeyframe::updatePose(){
+    torch::NoGradGuard no_grad;
+
+    bool has_nan = torch::isnan(this->theta_).any().item<bool>() && torch::isnan(this->rho_).any().item<bool>();
+    bool has_inf = torch::isinf(this->rho_).any().item<bool>() && torch::isinf(this->theta_).any().item<bool>();
+
+    auto theta_norm = this->theta_.norm().item<float>();
+    auto rho_norm = this->rho_.norm().item<float>();
+
+    bool valid = !(has_nan || has_inf) && (theta_norm > 1e-4f && rho_norm > 1e-4f);
+
+    if(valid){
+        float theta_thr = opt_params_->theta_lr_*10.f;
+        float rho_thr = opt_params_->rho_lr_*10.f;
+
+        if(theta_norm > theta_thr)
+            this->theta_.mul_(theta_thr / theta_norm);
+        if(rho_norm > rho_thr)
+            this->rho_.mul_(rho_thr / rho_norm);
+
+        auto delta_pose = general_utils::se3_exp(this->theta_, this->rho_);
+
+        if(!torch::isnan(delta_pose).any().item<bool>() && !torch::isinf(delta_pose).any().item<bool>()){
+            this->base_pose_ = delta_pose.mm(this->base_pose_);
+            this->Tcw_ = tensor_utils::TensorTransformation2SE3f(this->base_pose_).cast<double>();
+        }
+        else valid = false;
+    }
+
+    this->theta_.zero_(); this->rho_.zero_();
+    return valid;
+}
+
+void GaussianKeyframe::updateRenderMatrix(){
+    this->world_view_transform_ = this->base_pose_.transpose(0, 1);
+    this->projection_matrix_ = this->base_proj_.transpose(0, 1);
+    this->full_proj_transform_ = this->world_view_transform_.mm(this->projection_matrix_);
+    this->camera_center_ = this->world_view_transform_.inverse().index({3, torch::indexing::Slice(0, 3)});
+}
+
 void GaussianKeyframe::setCameraParams(const Camera& camera)
 {
     this->camera_id_ = camera.camera_id_;
@@ -119,19 +159,17 @@ void GaussianKeyframe::setPoint3DIdxForPoint2D(
 void GaussianKeyframe::computeTransformTensors()
 {
     if (this->set_pose_ && this->set_camera_) {
-        this->world_view_transform_ = tensor_utils::EigenMatrix2TorchTensor(
-            this->getWorld2View2(this->trans_, this->scale_),
-            torch::kCUDA
-        ).transpose(0, 1);
+        this->base_pose_ = tensor_utils::EigenMatrix2TorchTensor(
+            this->getWorld2View2(this->trans_, this->scale_), torch::kCUDA);
+        this->world_view_transform_ = this->base_pose_.transpose(0, 1);
 
         if (!this->set_projection_matrix_) {
-            this->projection_matrix_ = this->getProjectionMatrix(
-                this->znear_,
-                this->zfar_,
-                this->FoVx_,
-                this->FoVy_,
-                torch::kCUDA
-            ).transpose(0, 1);
+            this->base_proj_ = this->getProjectionMatrix(
+                this->znear_, this->zfar_,
+                this->FoVx_, this->FoVy_,
+                torch::kCUDA);
+
+            this->projection_matrix_ = this->base_proj_.transpose(0, 1);
             this->set_projection_matrix_ = true;
         }
 

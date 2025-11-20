@@ -193,10 +193,14 @@ protected:
     // void setInterruptTraining(const bool interrupt_training);
 
     void recordKeyframeRendered(
-        torch::Tensor &rendered,
+        torch::Tensor &rendered_image,
+        torch::Tensor &rendered_opacity,
+        torch::Tensor &rendered_depth,
         torch::Tensor &ground_truth,
         unsigned long kfid,
         std::filesystem::path result_img_dir,
+        std::filesystem::path result_opc_dir,
+        std::filesystem::path result_dpt_dir,
         std::filesystem::path result_gt_dir,
         std::filesystem::path result_loss_dir,
         std::string name_suffix = "");
@@ -207,6 +211,8 @@ protected:
         float &psnr_gs,
         double &render_time,
         std::filesystem::path result_img_dir,
+        std::filesystem::path result_opc_dir,
+        std::filesystem::path result_dpt_dir,
         std::filesystem::path result_gt_dir,
         std::filesystem::path result_loss_dir,
         std::string name_suffix = "");
@@ -309,8 +315,12 @@ protected:
     int keyframe_record_interval_;
     int all_keyframes_record_interval_;
     bool record_rendered_image_;
+    bool record_rendered_opacity_;
+    bool record_rendered_depth_;
+    bool record_rendered_depth_vis_;
     bool record_ground_truth_image_;
     bool record_loss_image_;
+    float rendered_depthmap_factor_ = 1000;
 
     int training_report_interval_;
     bool record_loop_ply_;

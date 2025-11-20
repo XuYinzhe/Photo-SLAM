@@ -66,6 +66,8 @@ add_library(cuda_rasterizer SHARED
     src/rasterize_points.cu
     include/stereo_vision.h
     src/stereo_vision.cu
+    # cuda_rasterizer/helper_math.h
+    # cuda_rasterizer/math.h
     cuda_rasterizer/auxiliary.h
     cuda_rasterizer/backward.cu
     cuda_rasterizer/backward.h

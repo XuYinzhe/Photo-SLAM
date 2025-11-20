@@ -68,6 +68,9 @@ public:
         float opacity_lr = 0.05f,
         float scaling_lr = 0.005f,
         float rotation_lr = 0.001f,
+        int pose_iter = 5,
+        float theta_lr = 0.005,
+        float rho_lr = 0.002,
         float percent_dense = 0.01f,
         float lambda_dssim = 0.2f,
         int densification_interval = 100,
@@ -86,6 +89,9 @@ public:
     float opacity_lr_;
     float scaling_lr_;
     float rotation_lr_;
+    int pose_iter_;
+    float theta_lr_;
+    float rho_lr_;
     float percent_dense_;
     float lambda_dssim_;
     int densification_interval_;

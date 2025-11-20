@@ -32,6 +32,7 @@
 #include "general_utils.h"
 #include "graphics_utils.h"
 #include "tensor_utils.h"
+#include "gaussian_parameters.h"
 
 class GaussianKeyframe
 {
@@ -40,6 +41,29 @@ public:
 
     GaussianKeyframe(std::size_t fid, int creation_iter = 0)
         : fid_(fid), creation_iter_(creation_iter) {}
+
+    GaussianKeyframe(std::size_t fid, GaussianOptimizationParams* opt_params, int creation_iter = 0)
+        : fid_(fid), creation_iter_(creation_iter), opt_params_(opt_params)
+    {
+        // this->theta_ = torch::zeros({3}, torch::dtype(torch::kFloat32).requires_grad(true).device(torch::kCUDA));
+        // this->rho_ = torch::zeros({3}, torch::dtype(torch::kFloat32).requires_grad(true).device(torch::kCUDA));
+
+        // pose optimizer
+        std::vector<torch::optim::OptimizerParamGroup> pose_param_groups;
+        auto options_rot = torch::optim::AdamOptions(opt_params->theta_lr_).betas({0.9, 0.999});
+        auto options_trans = torch::optim::AdamOptions(opt_params->rho_lr_).betas({0.9, 0.999});
+        
+        pose_param_groups.push_back( torch::optim::OptimizerParamGroup(
+            {this->theta_}, std::make_unique<torch::optim::AdamOptions>(options_rot)
+        ));
+        
+        pose_param_groups.push_back( torch::optim::OptimizerParamGroup(
+            {this->rho_}, std::make_unique<torch::optim::AdamOptions>(options_trans)
+        ));
+
+        this->pose_optimizer_ = std::make_unique<torch::optim::Adam>(pose_param_groups);
+    
+    }
 
     void setPose(
         const double qw,
@@ -56,6 +80,9 @@ public:
 
     Sophus::SE3d getPose();
     Sophus::SE3f getPosef();
+
+    bool updatePose();
+    void updateRenderMatrix();
 
     void setCameraParams(const Camera& camera);
 
@@ -80,6 +107,8 @@ public:
     int getCurrentGausPyramidLevel();
 
 public:
+    GaussianOptimizationParams* opt_params_;
+
     std::size_t fid_;
     int creation_iter_;
     int remaining_times_of_use_ = 0;
@@ -123,10 +152,16 @@ public:
     Eigen::Vector3f trans_ = {0.0f, 0.0f, 0.0f};
     float scale_ = 1.0f;
 
+    torch::Tensor base_pose_;
+    torch::Tensor base_proj_;
     torch::Tensor world_view_transform_;    ///< transform tensors
     torch::Tensor projection_matrix_;       ///< transform tensors
     torch::Tensor full_proj_transform_;     ///< transform tensors
     torch::Tensor camera_center_;           ///< transform tensors
+
+    std::unique_ptr<torch::optim::Adam> pose_optimizer_;
+    torch::Tensor theta_ = torch::zeros({3}, torch::dtype(torch::kFloat32).requires_grad(true).device(torch::kCUDA)); // rotation update
+    torch::Tensor rho_ = torch::zeros({3}, torch::dtype(torch::kFloat32).requires_grad(true).device(torch::kCUDA)); // translation update
 
     std::vector<Point2D> points2D_;
     std::vector<float> kps_pixel_;

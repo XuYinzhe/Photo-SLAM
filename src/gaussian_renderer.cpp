@@ -20,7 +20,7 @@
  * 
  * @return std::tuple<render, viewspace_points, visibility_filter, radii>, which are all `torch::Tensor`
  */
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 GaussianRenderer::render(
     std::shared_ptr<GaussianKeyframe> viewpoint_camera,
     int image_height,
@@ -29,6 +29,7 @@ GaussianRenderer::render(
     GaussianPipelineParams& pipe,
     torch::Tensor& bg_color,
     torch::Tensor& override_color,
+    bool fix_gs,
     float scaling_modifier,
     bool use_override_color)
 {
@@ -51,6 +52,8 @@ GaussianRenderer::render(
     float tanfovx = std::tan(viewpoint_camera->FoVx_ * 0.5f);
     float tanfovy = std::tan(viewpoint_camera->FoVy_ * 0.5f);
 
+    viewpoint_camera->updateRenderMatrix();
+
     GaussianRasterizationSettings raster_settings(
         image_height,
         image_width,
@@ -60,9 +63,10 @@ GaussianRenderer::render(
         scaling_modifier,
         viewpoint_camera->world_view_transform_,
         viewpoint_camera->full_proj_transform_,
+        viewpoint_camera->projection_matrix_,
         pc->active_sh_degree_,
         viewpoint_camera->camera_center_,
-        false
+        false, false
     );
 
     GaussianRasterizer rasterizer(raster_settings);
@@ -118,6 +122,14 @@ GaussianRenderer::render(
         }
     }
 
+    if(fix_gs){
+        means3D = means3D.detach();
+        opacity = opacity.detach();
+        scales = scales.detach();
+        rotations = rotations.detach();
+        shs = shs.detach();
+    }
+
     // Rasterize visible Gaussians to image, obtain their radii (on screen). 
     auto rasterizer_result = rasterizer.forward(
         means3D,
@@ -132,10 +144,16 @@ GaussianRenderer::render(
         colors_precomp,
         scales,
         rotations,
-        cov3D_precomp
+        cov3D_precomp,
+        viewpoint_camera->theta_,
+        viewpoint_camera->rho_
     );
+
     auto rendered_image = std::get<0>(rasterizer_result);
     auto radii = std::get<1>(rasterizer_result);
+    auto depth = std::get<2>(rasterizer_result);
+    auto opacities = std::get<3>(rasterizer_result);
+    auto n_touched = std::get<4>(rasterizer_result);
 
     /* Those Gaussians that were frustum culled or had a radius of 0 were not visible.
        They will be excluded from value updates used in the splitting criteria.
@@ -144,6 +162,9 @@ GaussianRenderer::render(
         rendered_image,     /*render*/
         screenspace_points, /*viewspace_points*/
         radii > 0,          /*visibility_filter*/
-        radii               /*radii*/
+        radii,               /*radii*/
+        depth,
+        opacities,
+        n_touched
     );
 }

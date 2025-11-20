@@ -312,6 +312,12 @@ void GaussianMapper::readConfigFromFile(std::filesystem::path cfg_path)
         settings_file["Record.all_keyframes_record_interval"].operator int();
     record_rendered_image_ = 
         (settings_file["Record.record_rendered_image"].operator int()) != 0;
+    record_rendered_opacity_ = 
+        (settings_file["Record.record_rendered_opacity"].operator int()) != 0;
+    record_rendered_depth_ = 
+        (settings_file["Record.record_rendered_depth"].operator int()) != 0;
+    record_rendered_depth_vis_ = 
+        (settings_file["Record.record_rendered_depth_vis"].operator int()) != 0;
     record_ground_truth_image_ = 
         (settings_file["Record.record_ground_truth_image"].operator int()) != 0;
     record_loss_image_ = 
@@ -340,6 +346,12 @@ void GaussianMapper::readConfigFromFile(std::filesystem::path cfg_path)
         settings_file["Optimization.scaling_lr"].operator float();
     opt_params_.rotation_lr_ =
         settings_file["Optimization.rotation_lr"].operator float();
+    opt_params_.pose_iter_ =
+        settings_file["Optimization.pose_iter"].operator int();
+    opt_params_.theta_lr_ =
+        settings_file["Optimization.theta_lr"].operator float();
+    opt_params_.rho_lr_ =
+        settings_file["Optimization.rho_lr"].operator float();
 
     opt_params_.percent_dense_ =
         settings_file["Optimization.percent_dense"].operator float();
@@ -397,7 +409,7 @@ void GaussianMapper::run()
                     scene_->cachePoint3D(pMP->mnId, point3D);
                 }
                 for (const auto& pKF : vpKFs){
-                    std::shared_ptr<GaussianKeyframe> new_kf = std::make_shared<GaussianKeyframe>(pKF->mnId, getIteration());
+                    std::shared_ptr<GaussianKeyframe> new_kf = std::make_shared<GaussianKeyframe>(pKF->mnId, &this->opt_params_, getIteration());
                     new_kf->zfar_ = z_far_;
                     new_kf->znear_ = z_near_;
                     // Pose
@@ -649,6 +661,40 @@ void GaussianMapper::trainForOneIteration()
     // Mutex lock for usage of the gaussian model
     std::unique_lock<std::mutex> lock_render(mutex_render_);
 
+    // if(getIteration() > opt_params_.densify_from_iter_ && opt_params_.pose_iter_>0)
+    // for(int i=0; i<opt_params_.pose_iter_; i++) {
+    //     auto render_pkg = GaussianRenderer::render(
+    //         viewpoint_cam,
+    //         image_height,
+    //         image_width,
+    //         gaussians_,
+    //         pipe_params_,
+    //         background_,
+    //         override_color_,
+    //         true
+    //     );
+
+    //     auto rendered_image = std::get<0>(render_pkg);
+    //     torch::Tensor masked_image = rendered_image * mask;
+
+    //     auto Ll1 = loss_utils::l1_loss(masked_image, gt_image);
+    //     float lambda_dssim = lambdaDssim();
+    //     auto loss = (1.0 - lambda_dssim) * Ll1
+    //                 + lambda_dssim * (1.0 - loss_utils::ssim(masked_image, gt_image, device_type_));
+
+    //     loss.backward();
+    //     std::cout<<"[Gaussian Mapper] Iteration "<< getIteration() <<", pose optimization step "<< i+1 <<", loss: "<< loss.item().toFloat() <<std::endl;
+
+    //     {
+    //         torch::NoGradGuard no_grad;
+    //         gaussians_->optimizer_->zero_grad(true);
+    //         viewpoint_cam->pose_optimizer_->step();
+    //         viewpoint_cam->pose_optimizer_->zero_grad(true);
+
+    //         viewpoint_cam->updatePose();
+    //     }
+    // }
+
     // Every 1000 its we increase the levels of SH up to a maximum degree
     if (getIteration() % 1000 == 0 && default_sh_ < model_params_.sh_degree_)
         default_sh_ += 1;
@@ -704,9 +750,9 @@ void GaussianMapper::trainForOneIteration()
         torch::NoGradGuard no_grad;
         ema_loss_for_log_ = 0.4f * loss.item().toFloat() + 0.6 * ema_loss_for_log_;
 
-        if (keyframe_record_interval_ &&
-            getIteration() % keyframe_record_interval_ == 0)
-            recordKeyframeRendered(masked_image, gt_image, viewpoint_cam->fid_, result_dir_, result_dir_, result_dir_);
+        // if (keyframe_record_interval_ &&
+        //     getIteration() % keyframe_record_interval_ == 0)
+        //     recordKeyframeRendered(masked_image, gt_image, viewpoint_cam->fid_, result_dir_, result_dir_, result_dir_);
 
         // Densification
         if (getIteration() < opt_params_.densify_until_iter_) {
@@ -769,6 +815,9 @@ void GaussianMapper::trainForOneIteration()
         if (getIteration() < opt_params_.iterations_) {
             gaussians_->optimizer_->step();
             gaussians_->optimizer_->zero_grad(true);
+            if(opt_params_.pose_iter_>0) viewpoint_cam->pose_optimizer_->step();
+            viewpoint_cam->pose_optimizer_->zero_grad(true);
+            if(opt_params_.pose_iter_>0) viewpoint_cam->updatePose();
         }
     }
 }
@@ -817,8 +866,7 @@ void GaussianMapper::combineMappingOperations()
         {
         case ORB_SLAM3::MappingOperation::OprType::LocalMappingBA:
         {
-            // std::cout << "[Gaussian Mapper]Local BA Detected."
-            //           << std::endl;
+            // std::cout << "[Gaussian Mapper]Local BA Detected." << std::endl;
 
             // Get new keyframes
             auto& associated_kfs = opr.associatedKeyFrames();
@@ -1023,7 +1071,7 @@ void GaussianMapper::handleNewKeyframe(
                 std::string> &kf)
 {
     std::shared_ptr<GaussianKeyframe> pkf =
-        std::make_shared<GaussianKeyframe>(std::get<0>(kf), getIteration());
+        std::make_shared<GaussianKeyframe>(std::get<0>(kf), &this->opt_params_, getIteration());
     pkf->zfar_ = z_far_;
     pkf->znear_ = z_near_;
     // Pose
@@ -1487,19 +1535,47 @@ void GaussianMapper::increasePcdByKeyframeInactiveGeoDensify(
 // }
 
 void GaussianMapper::recordKeyframeRendered(
-        torch::Tensor &rendered,
+        torch::Tensor &rendered_image,
+        torch::Tensor &rendered_opacity,
+        torch::Tensor &rendered_depth,
         torch::Tensor &ground_truth,
         unsigned long kfid,
         std::filesystem::path result_img_dir,
+        std::filesystem::path result_opc_dir,
+        std::filesystem::path result_dpt_dir,
         std::filesystem::path result_gt_dir,
         std::filesystem::path result_loss_dir,
         std::string name_suffix)
 {
     if (record_rendered_image_) {
-        auto image_cv = tensor_utils::torchTensor2CvMat_Float32(rendered);
+        auto image_cv = tensor_utils::torchTensor2CvMat_Float32(rendered_image);
         cv::cvtColor(image_cv, image_cv, CV_RGB2BGR);
         image_cv.convertTo(image_cv, CV_8UC3, 255.0f);
         cv::imwrite(result_img_dir / (std::to_string(getIteration()) + "_" + std::to_string(kfid) + name_suffix + ".jpg"), image_cv);
+    }
+
+    if (record_rendered_opacity_) {
+        // std::cout<<"[debug] opc min "<<rendered_opacity.min()<<std::endl;
+        // std::cout<<"[debug] opc max "<<rendered_opacity.max()<<std::endl;
+        auto opacity_cv = tensor_utils::torchTensor2CvMat_Float32(rendered_opacity);
+        opacity_cv.convertTo(opacity_cv, CV_8UC1, 255.0f);
+        cv::imwrite(result_opc_dir / (std::to_string(getIteration()) + "_" + std::to_string(kfid) + name_suffix + ".png"), opacity_cv);
+    }
+
+    if (record_rendered_depth_) {
+        // std::cout<<"[debug] dpt min "<<rendered_depth.min()<<std::endl;
+        // std::cout<<"[debug] dpt max "<<rendered_depth.max()<<std::endl;
+        // float norm = rendered_depth.max().item<float>() * this->rendered_depthmap_factor_;
+        auto depth_cv = tensor_utils::torchTensor2CvMat_Float32(rendered_depth);
+        depth_cv = depth_cv * this->rendered_depthmap_factor_;
+        if(record_rendered_depth_vis_){
+            depth_cv.convertTo(depth_cv, CV_8UC1, 255.0f/10000.f, 0.f);
+            cv::imwrite(result_dpt_dir / (std::to_string(getIteration()) + "_" + std::to_string(kfid) + name_suffix + ".jpg"), depth_cv);
+        }
+        else{
+            depth_cv.convertTo(depth_cv, CV_16UC1);
+            cv::imwrite(result_dpt_dir / (std::to_string(getIteration()) + "_" + std::to_string(kfid) + name_suffix + ".png"), depth_cv);
+        }
     }
 
     if (record_ground_truth_image_) {
@@ -1510,7 +1586,7 @@ void GaussianMapper::recordKeyframeRendered(
     }
 
     if (record_loss_image_) {
-        torch::Tensor loss_tensor = torch::abs(rendered - ground_truth);
+        torch::Tensor loss_tensor = torch::abs(rendered_image - ground_truth);
         auto loss_image_cv = tensor_utils::torchTensor2CvMat_Float32(loss_tensor);
         cv::cvtColor(loss_image_cv, loss_image_cv, CV_RGB2BGR);
         loss_image_cv.convertTo(loss_image_cv, CV_8UC3, 255.0f);
@@ -1544,7 +1620,7 @@ cv::Mat GaussianMapper::renderFromPose(
         throw std::runtime_error("[GaussianMapper::renderFromPose]KeyFrame Camera not found!");
     }
 
-    std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> render_pkg;
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> render_pkg;
     {
         std::unique_lock<std::mutex> lock_render(mutex_render_);
         // Render
@@ -1575,6 +1651,8 @@ void GaussianMapper::renderAndRecordKeyframe(
     float &psnr_gs,
     double &render_time,
     std::filesystem::path result_img_dir,
+    std::filesystem::path result_opc_dir,
+    std::filesystem::path result_dpt_dir,
     std::filesystem::path result_gt_dir,
     std::filesystem::path result_loss_dir,
     std::string name_suffix)
@@ -1590,7 +1668,11 @@ void GaussianMapper::renderAndRecordKeyframe(
         override_color_
     );
     auto rendered_image = std::get<0>(render_pkg);
+    auto rendered_opacity = std::get<5>(render_pkg);
+    auto rendered_depth = std::get<4>(render_pkg);
     torch::Tensor masked_image = rendered_image * undistort_mask_[pkf->camera_id_];
+    torch::Tensor masked_opacity = rendered_opacity.squeeze() * undistort_mask_[pkf->camera_id_];
+    torch::Tensor masked_depth = rendered_depth.squeeze() * undistort_mask_[pkf->camera_id_];
     torch::cuda::synchronize();
     auto end_timing = std::chrono::steady_clock::now();
     auto render_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_timing - start_timing).count();
@@ -1601,7 +1683,7 @@ void GaussianMapper::renderAndRecordKeyframe(
     psnr = loss_utils::psnr(masked_image, gt_image).item().toFloat();
     psnr_gs = loss_utils::psnr_gaussian_splatting(masked_image, gt_image).item().toFloat();
 
-    recordKeyframeRendered(masked_image, gt_image, pkf->fid_, result_img_dir, result_gt_dir, result_loss_dir, name_suffix);    
+    recordKeyframeRendered(masked_image, masked_opacity, masked_depth, gt_image, pkf->fid_, result_img_dir, result_opc_dir, result_dpt_dir, result_gt_dir, result_loss_dir, name_suffix);    
 }
 
 void GaussianMapper::renderAndRecordAllKeyframes(
@@ -1613,6 +1695,14 @@ void GaussianMapper::renderAndRecordAllKeyframes(
     std::filesystem::path image_dir = result_dir / "image";
     if (record_rendered_image_)
         CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(image_dir);
+
+    std::filesystem::path opacity_dir = result_dir / "opacity";
+    if (record_rendered_opacity_)
+        CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(opacity_dir);
+
+    std::filesystem::path depth_dir = result_dir / "depth";
+    if (record_rendered_depth_)
+        CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(depth_dir);
 
     std::filesystem::path image_gt_dir = result_dir / "image_gt";
     if (record_ground_truth_image_)
@@ -1643,8 +1733,15 @@ void GaussianMapper::renderAndRecordAllKeyframes(
     auto kfit = scene_->keyframes().begin();
     float dssim, psnr, psnr_gs;
     double render_time;
+
+    float sum_dssim = 0.0f;
+    float sum_psnr = 0.0f;
+    float sum_psnr_gs = 0.0f;
     for (std::size_t i = 0; i < nkfs; ++i) {
-        renderAndRecordKeyframe((*kfit).second, dssim, psnr, psnr_gs, render_time, image_dir, image_gt_dir, image_loss_dir);
+        sum_dssim += dssim;
+        sum_psnr += psnr;
+        sum_psnr_gs += psnr_gs;
+        renderAndRecordKeyframe((*kfit).second, dssim, psnr, psnr_gs, render_time, image_dir, opacity_dir, depth_dir, image_gt_dir, image_loss_dir);
         out_time << (*kfit).first << " " << std::fixed << std::setprecision(8) << render_time << std::endl;
 
         out_dssim   << (*kfit).first << " " << std::fixed << std::setprecision(10) << dssim   << std::endl;
@@ -1653,6 +1750,12 @@ void GaussianMapper::renderAndRecordAllKeyframes(
 
         ++kfit;
     }
+    sum_dssim /= static_cast<float>(nkfs);
+    sum_psnr /= static_cast<float>(nkfs);
+    sum_psnr_gs /= static_cast<float>(nkfs);
+    std::cout << "[Gaussian Mapper]Average DSSIM over all keyframes: " << sum_dssim << std::endl;
+    std::cout << "[Gaussian Mapper]Average PSNR over all keyframes: " << sum_psnr << std::endl;
+    std::cout << "[Gaussian Mapper]Average PSNR (Gaussian Splatting) over all keyframes: " << sum_psnr_gs << std::endl;
 }
 
 void GaussianMapper::savePly(std::filesystem::path result_dir)

@@ -55,4 +55,92 @@ inline torch::Tensor build_rotation(torch::Tensor &r)
     return R;
 }
 
+inline torch::Tensor se3_exp(torch::Tensor omega, torch::Tensor v) {
+    // Rotation SO3
+    torch::Tensor theta = torch::norm(omega);
+
+    torch::Tensor omega_hat = torch::zeros({3, 3}, omega.options());
+    omega_hat[0][1] = -omega[2]; omega_hat[0][2] = omega[1];
+    omega_hat[1][0] = omega[2];  omega_hat[1][2] = -omega[0];
+    omega_hat[2][0] = -omega[1]; omega_hat[2][1] = omega[0];
+    torch::Tensor omega_hat2 = torch::matmul(omega_hat, omega_hat);
+
+    torch::Tensor R = torch::eye(3, omega.options());
+    auto theta_val = theta.item<float>();
+    if (theta_val > 1e-5) {
+        torch::Tensor A = torch::sin(theta) / theta;
+        torch::Tensor B = (1 - torch::cos(theta)) / (theta * theta);
+        R = R + A * omega_hat + B * omega_hat2;
+    } else 
+        R = R + omega_hat + 0.5 * omega_hat2;
+
+    // Translation
+    torch::Tensor V = torch::eye(3, omega.options());
+    if (theta_val > 1e-5) {
+        torch::Tensor C = (1 - torch::cos(theta)) / (theta * theta);
+        torch::Tensor D = (theta - torch::sin(theta)) / (theta * theta * theta);
+        V = V + C * omega_hat + D * omega_hat2;
+    } else 
+        V = V + 0.5 * omega_hat + (1.0/6.0) * omega_hat2;
+
+    torch::Tensor t = torch::matmul(V, v.unsqueeze(-1)).squeeze(-1);
+
+    // SE3
+    torch::Tensor T = torch::eye(4, omega.options());
+    T.slice(0, 0, 3).slice(1, 0, 3) = R;
+    T.slice(0, 0, 3).slice(1, 3, 4) = t.unsqueeze(-1);
+    return T;
+}
+
+inline std::tuple<torch::Tensor, torch::Tensor> se3_log(torch::Tensor T) {
+    torch::Tensor R = T.slice(0, 0, 3).slice(1, 0, 3);
+    torch::Tensor t = T.slice(0, 0, 3).slice(1, 3, 4).squeeze(1);
+
+    // unscaled rotation vector from R
+    torch::Tensor omega_unscaled = torch::stack({
+        R.index({2, 1}) - R.index({1, 2}),  // R[2,1] - R[1,2]
+        R.index({0, 2}) - R.index({2, 0}),  // R[0,2] - R[2,0]
+        R.index({1, 0}) - R.index({0, 1})   // R[1,0] - R[0,1]
+    });
+
+    // rotation angle (theta)
+    torch::Tensor trace_R = R.index({0, 0}) + R.index({1, 1}) + R.index({2, 2});
+    torch::Tensor tr_clamped = torch::clamp((trace_R - 1.0) / 2.0, -1.0, 1.0);
+    torch::Tensor theta = torch::acos(tr_clamped);
+
+    torch::Tensor omega, v;
+    float theta_val = theta.item<float>();
+    
+    if (theta_val < 1e-5) {
+        // Rotation
+        omega = 0.5 * omega_unscaled;
+        
+        // Translation
+        auto cross1 = torch::cross(omega, t);  // ω × t
+        auto cross2 = torch::cross(omega, cross1);  // ω × (ω × t)
+        v = t - 0.5 * cross1 + (1.0 / 12.0) * cross2;
+    } else {
+        omega = (theta / (2.0 * torch::sin(theta))) * omega_unscaled;
+        
+        torch::Tensor sin_theta = torch::sin(theta);
+        torch::Tensor cos_theta = torch::cos(theta);
+        torch::Tensor one_minus_cos_theta = 1.0 - cos_theta;
+        torch::Tensor A = (theta * sin_theta) / (2.0 * one_minus_cos_theta);
+        torch::Tensor factor = (1.0 - A) / (theta * theta);
+
+        // skew-symmetric matrix for omega
+        torch::Tensor omega_skew = torch::zeros({3, 3}, T.options());
+        omega_skew[0][1] = -omega[2]; omega_skew[0][2] = omega[1];
+        omega_skew[1][0] = omega[2];  omega_skew[1][2] = -omega[0];
+        omega_skew[2][0] = -omega[1]; omega_skew[2][1] = omega[0];
+
+        // V^{-1}
+        torch::Tensor omega_skew2 = torch::mm(omega_skew, omega_skew);
+        torch::Tensor V_inv = torch::eye(3, T.options()) - 0.5 * omega_skew + factor * omega_skew2;
+        v = torch::mm(V_inv, t.unsqueeze(1)).squeeze(1);
+    }
+
+    return std::make_tuple(omega, v);
+}
+
 }
