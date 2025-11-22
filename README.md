@@ -8,6 +8,13 @@ In Proceedings of Computer Vision and Pattern Recognition Conference (CVPR), 202
 ![image](https://huajianup.github.io/thumbnails/Photo-SLAM_v2.gif "photo-slam")
 
 
+## Underwater Branch
+Run the underwater data by the script. The underwater video can be downloaded at the [link](https://hkust-vgd.nas.ust.hk:5001/sharing/2TzLKgzDY).
+```
+bash ./script/gh010572.sh
+```
+The underwater imgary model is implemented based on [SeaSplat](https://github.com/dxyang/seasplat/).
+
 ## Prerequisites
 
 ### (Optional) Using Docker
