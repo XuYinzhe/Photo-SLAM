@@ -13,7 +13,7 @@ Run the underwater data by the script. The underwater video can be downloaded at
 ```
 bash ./script/gh010572.sh
 ```
-The underwater imgary model is implemented based on [SeaSplat](https://github.com/dxyang/seasplat/).
+The underwater imagery model is implemented based on [SeaSplat](https://github.com/dxyang/seasplat/).
 
 ## Prerequisites
 

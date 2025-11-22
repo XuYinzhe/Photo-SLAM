@@ -48,6 +48,7 @@
 #include "gaussian_keyframe.h"
 #include "gaussian_scene.h"
 #include "gaussian_trainer.h"
+#include "uw_models.h"
 
 #define CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(dir)                                       \
     if (!dir.empty() && !std::filesystem::exists(dir))                                      \
@@ -197,12 +198,18 @@ protected:
         torch::Tensor &rendered_opacity,
         torch::Tensor &rendered_depth,
         torch::Tensor &ground_truth,
+        torch::Tensor &masked_uw_image,
+        torch::Tensor &uw_at_image,
+        torch::Tensor &uw_bs_image,
         unsigned long kfid,
         std::filesystem::path result_img_dir,
         std::filesystem::path result_opc_dir,
         std::filesystem::path result_dpt_dir,
         std::filesystem::path result_gt_dir,
         std::filesystem::path result_loss_dir,
+        std::filesystem::path result_uw_dir,
+        std::filesystem::path result_uw_at_dir,
+        std::filesystem::path result_uw_bs_dir,
         std::string name_suffix = "");
     void renderAndRecordKeyframe(
         std::shared_ptr<GaussianKeyframe> pkf,
@@ -215,6 +222,9 @@ protected:
         std::filesystem::path result_dpt_dir,
         std::filesystem::path result_gt_dir,
         std::filesystem::path result_loss_dir,
+        std::filesystem::path result_uw_dir,
+        std::filesystem::path result_uw_at_dir,
+        std::filesystem::path result_uw_bs_dir,
         std::string name_suffix = "");
     void renderAndRecordAllKeyframes(
         std::string name_suffix = "");
@@ -275,7 +285,7 @@ protected:
     float ema_loss_for_log_;
     bool SLAM_ended_;
     bool loop_closure_iteration_;
-    bool keep_training_ = false;
+    bool keep_training_ = true;
     int default_sh_ = 0;
 
     // Settings
@@ -327,6 +337,12 @@ protected:
 
     int prune_big_point_after_iter_;
     float densify_min_opacity_ = 20;
+
+    // uw
+    std::unique_ptr<torch::optim::Adam> at_optimizer_;
+    std::unique_ptr<torch::optim::Adam> bs_optimizer_;
+    std::shared_ptr<uw::AttenuateNet> attenuate_net_;
+    std::shared_ptr<uw::BackscatterNet> backscatter_net_;
 
     // Tools
     std::random_device rd_;

@@ -227,6 +227,17 @@ GaussianMapper::GaussianMapper(
         }
         this->scene_->addCamera(camera);
     }
+
+    //uw
+    this->attenuate_net_ = std::make_shared<uw::AttenuateNet>();
+    this->backscatter_net_ = std::make_shared<uw::BackscatterNet>();
+    this->at_optimizer_ = std::make_unique<torch::optim::Adam>(
+        this->attenuate_net_->parameters(),
+        torch::optim::AdamOptions(opt_params_.bs_at_lr_).betas(std::make_tuple(0.9, 0.999)));
+    this->bs_optimizer_ = std::make_unique<torch::optim::Adam>(
+        this->backscatter_net_->parameters(),
+        torch::optim::AdamOptions(opt_params_.bs_at_lr_).betas(std::make_tuple(0.9, 0.999)));
+
 }
 
 void GaussianMapper::readConfigFromFile(std::filesystem::path cfg_path)
@@ -372,6 +383,12 @@ void GaussianMapper::readConfigFromFile(std::filesystem::path cfg_path)
         settings_file["Optimization.prune_big_point_after_iter"].operator int();
     densify_min_opacity_ =
         settings_file["Optimization.densify_min_opacity"].operator float();
+
+    // uw
+    opt_params_.enable_uw_ =
+        (settings_file["Optimization.enable_uw"].operator int()) != 0;
+    opt_params_.bs_at_lr_ =
+        settings_file["Optimization.bs_at_lr"].operator float();
 
     // Viewer Parameters
     rendered_image_viewer_scale_ =
@@ -733,9 +750,25 @@ void GaussianMapper::trainForOneIteration()
     auto viewspace_point_tensor = std::get<1>(render_pkg);
     auto visibility_filter = std::get<2>(render_pkg);
     auto radii = std::get<3>(render_pkg);
+    auto rendered_depth = std::get<4>(render_pkg);
+    auto rendered_opacity = std::get<5>(render_pkg);
+
+    // if(getIteration() == 100)
+    // std::cout<<"[debug] rgb sizes : "<< rendered_image.sizes() <<", depth sizes: "<< rendered_depth.sizes() <<", opacity sizes: "<< rendered_opacity.sizes() <<std::endl;
+    // // [debug] rgb sizes : [3, 145, 258], depth sizes: [1, 145, 258], opacity sizes: [1, 145, 258]
+
+    torch::Tensor masked_image;
+    if(opt_params_.enable_uw_){
+        auto rendered_depth_norm = uw::normalize_depth(rendered_depth, rendered_opacity);
+        auto uw_direct = rendered_image * this->attenuate_net_->forward(rendered_depth_norm);
+        auto uw_backscatter = this->backscatter_net_->forward(rendered_depth_norm);
+        auto uw_rendered_image = torch::clamp(uw_direct + uw_backscatter, 0.0f, 1.0f);
+        masked_image = uw_rendered_image * mask;
+    }
+    else masked_image = rendered_image * mask;
 
     // Get rid of black edges caused by undistortion
-    torch::Tensor masked_image = rendered_image * mask;
+    // torch::Tensor masked_image = rendered_image * mask;
 
     // Loss
     auto Ll1 = loss_utils::l1_loss(masked_image, gt_image);
@@ -749,6 +782,16 @@ void GaussianMapper::trainForOneIteration()
     {
         torch::NoGradGuard no_grad;
         ema_loss_for_log_ = 0.4f * loss.item().toFloat() + 0.6 * ema_loss_for_log_;
+
+        // if(getIteration() == 100)
+        // {
+        //     auto rendered_depth_norm = uw::normalize_depth(rendered_depth, rendered_opacity);
+        //     auto uw_direct = rendered_image * this->attenuate_net_->forward(rendered_depth_norm);
+        //     auto uw_backscatter = this->backscatter_net_->forward(rendered_depth_norm);
+        //     auto uw_rendered_image = torch::clamp(uw_direct + uw_backscatter, 0.0f, 1.0f);
+        //     std::cout<<"[debug] direct sizes: "<< uw_direct.sizes() <<", backscatter sizes: "<< uw_backscatter.sizes() <<", uw_rendered_image sizes: "<< uw_rendered_image.sizes() <<std::endl;
+        //     // [debug] direct sizes: [3, 145, 258], backscatter sizes: [3, 145, 258], uw_rendered_image sizes: [3, 145, 258]
+        // }
 
         // if (keyframe_record_interval_ &&
         //     getIteration() % keyframe_record_interval_ == 0)
@@ -818,6 +861,10 @@ void GaussianMapper::trainForOneIteration()
             if(opt_params_.pose_iter_>0) viewpoint_cam->pose_optimizer_->step();
             viewpoint_cam->pose_optimizer_->zero_grad(true);
             if(opt_params_.pose_iter_>0) viewpoint_cam->updatePose();
+            if(opt_params_.enable_uw_) at_optimizer_->step();
+            at_optimizer_->zero_grad(true);
+            if(opt_params_.enable_uw_) bs_optimizer_->step();
+            bs_optimizer_->zero_grad(true);
         }
     }
 }
@@ -1539,12 +1586,18 @@ void GaussianMapper::recordKeyframeRendered(
         torch::Tensor &rendered_opacity,
         torch::Tensor &rendered_depth,
         torch::Tensor &ground_truth,
+        torch::Tensor &masked_uw_image,
+        torch::Tensor &uw_at_image,
+        torch::Tensor &uw_bs_image,
         unsigned long kfid,
         std::filesystem::path result_img_dir,
         std::filesystem::path result_opc_dir,
         std::filesystem::path result_dpt_dir,
         std::filesystem::path result_gt_dir,
         std::filesystem::path result_loss_dir,
+        std::filesystem::path result_uw_dir,
+        std::filesystem::path result_uw_at_dir,
+        std::filesystem::path result_uw_bs_dir,
         std::string name_suffix)
 {
     if (record_rendered_image_) {
@@ -1591,6 +1644,25 @@ void GaussianMapper::recordKeyframeRendered(
         cv::cvtColor(loss_image_cv, loss_image_cv, CV_RGB2BGR);
         loss_image_cv.convertTo(loss_image_cv, CV_8UC3, 255.0f);
         cv::imwrite(result_loss_dir / (std::to_string(getIteration()) + "_" + std::to_string(kfid) + name_suffix + "_loss.jpg"), loss_image_cv);
+    }
+
+    if(opt_params_.enable_uw_){
+        auto uw_image_cv = tensor_utils::torchTensor2CvMat_Float32(masked_uw_image);
+        cv::cvtColor(uw_image_cv, uw_image_cv, CV_RGB2BGR);
+        uw_image_cv.convertTo(uw_image_cv, CV_8UC3, 255.0f);
+        cv::imwrite(result_uw_dir / (std::to_string(getIteration()) + "_" + std::to_string(kfid) + name_suffix + "_uw.jpg"), uw_image_cv);
+        
+        uw_at_image = torch::clamp(uw_at_image, 0.0f, 1.0f);
+        auto uw_at_image_cv = tensor_utils::torchTensor2CvMat_Float32(uw_at_image);
+        cv::cvtColor(uw_at_image_cv, uw_at_image_cv, CV_RGB2BGR);
+        uw_at_image_cv.convertTo(uw_at_image_cv, CV_8UC3, 255.0f);
+        cv::imwrite(result_uw_at_dir / (std::to_string(getIteration()) + "_" + std::to_string(kfid) + name_suffix + "_uw_at.jpg"), uw_at_image_cv);
+        
+        uw_bs_image = torch::clamp(uw_bs_image, 0.0f, 1.0f);
+        auto uw_bs_image_cv = tensor_utils::torchTensor2CvMat_Float32(uw_bs_image);
+        cv::cvtColor(uw_bs_image_cv, uw_bs_image_cv, CV_RGB2BGR);
+        uw_bs_image_cv.convertTo(uw_bs_image_cv, CV_8UC3, 255.0f);
+        cv::imwrite(result_uw_bs_dir / (std::to_string(getIteration()) + "_" + std::to_string(kfid) + name_suffix + "_uw_bs.jpg"), uw_bs_image_cv);
     }
 }
 
@@ -1655,6 +1727,9 @@ void GaussianMapper::renderAndRecordKeyframe(
     std::filesystem::path result_dpt_dir,
     std::filesystem::path result_gt_dir,
     std::filesystem::path result_loss_dir,
+    std::filesystem::path result_uw_dir,
+    std::filesystem::path result_uw_at_dir,
+    std::filesystem::path result_uw_bs_dir,
     std::string name_suffix)
 {
     auto start_timing = std::chrono::steady_clock::now();
@@ -1673,17 +1748,36 @@ void GaussianMapper::renderAndRecordKeyframe(
     torch::Tensor masked_image = rendered_image * undistort_mask_[pkf->camera_id_];
     torch::Tensor masked_opacity = rendered_opacity.squeeze() * undistort_mask_[pkf->camera_id_];
     torch::Tensor masked_depth = rendered_depth.squeeze() * undistort_mask_[pkf->camera_id_];
+    torch::Tensor uw_image, uw_at_image, uw_bs_image, masked_uw_image;
+    if(opt_params_.enable_uw_){
+        auto rendered_depth_norm = uw::normalize_depth(rendered_depth, rendered_opacity);
+        uw_at_image = rendered_image * this->attenuate_net_->forward(rendered_depth_norm);
+        uw_bs_image = this->backscatter_net_->forward(rendered_depth_norm);
+        uw_image = torch::clamp(uw_at_image + uw_bs_image, 0.0f, 1.0f);
+        masked_uw_image = uw_image * undistort_mask_[pkf->camera_id_];
+    }
     torch::cuda::synchronize();
     auto end_timing = std::chrono::steady_clock::now();
     auto render_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_timing - start_timing).count();
     render_time = 1e-6 * render_time_ns;
     auto gt_image = pkf->original_image_;
 
-    dssim = loss_utils::ssim(masked_image, gt_image, device_type_).item().toFloat();
-    psnr = loss_utils::psnr(masked_image, gt_image).item().toFloat();
-    psnr_gs = loss_utils::psnr_gaussian_splatting(masked_image, gt_image).item().toFloat();
+    if(opt_params_.enable_uw_){
+        dssim = loss_utils::ssim(masked_uw_image, gt_image, device_type_).item().toFloat();
+        psnr = loss_utils::psnr(masked_uw_image, gt_image).item().toFloat();
+        psnr_gs = loss_utils::psnr_gaussian_splatting(masked_uw_image, gt_image).item().toFloat();
+    }
+    else{
+        dssim = loss_utils::ssim(masked_image, gt_image, device_type_).item().toFloat();
+        psnr = loss_utils::psnr(masked_image, gt_image).item().toFloat();
+        psnr_gs = loss_utils::psnr_gaussian_splatting(masked_image, gt_image).item().toFloat();
+    }
 
-    recordKeyframeRendered(masked_image, masked_opacity, masked_depth, gt_image, pkf->fid_, result_img_dir, result_opc_dir, result_dpt_dir, result_gt_dir, result_loss_dir, name_suffix);    
+    recordKeyframeRendered(masked_image, masked_opacity, masked_depth, gt_image, 
+        masked_uw_image, uw_at_image, uw_bs_image, pkf->fid_, 
+        result_img_dir, result_opc_dir, result_dpt_dir, result_gt_dir, result_loss_dir, 
+        result_uw_dir, result_uw_at_dir, result_uw_bs_dir,
+        name_suffix);    
 }
 
 void GaussianMapper::renderAndRecordAllKeyframes(
@@ -1711,6 +1805,17 @@ void GaussianMapper::renderAndRecordAllKeyframes(
     std::filesystem::path image_loss_dir = result_dir / "image_loss";
     if (record_loss_image_) {
         CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(image_loss_dir);
+    }
+
+    std::filesystem::path image_uw_dir = result_dir / "image_uw";
+    std::filesystem::path image_uw_at_dir = result_dir / "image_uw_at";
+    std::filesystem::path image_uw_bs_dir = result_dir / "image_uw_bs";
+    if (opt_params_.enable_uw_) {
+        if (record_rendered_image_) {
+            CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(image_uw_dir);
+            CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(image_uw_at_dir);
+            CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(image_uw_bs_dir);
+        }
     }
 
     std::filesystem::path render_time_path = result_dir / "render_time.txt";
@@ -1741,7 +1846,9 @@ void GaussianMapper::renderAndRecordAllKeyframes(
         sum_dssim += dssim;
         sum_psnr += psnr;
         sum_psnr_gs += psnr_gs;
-        renderAndRecordKeyframe((*kfit).second, dssim, psnr, psnr_gs, render_time, image_dir, opacity_dir, depth_dir, image_gt_dir, image_loss_dir);
+        renderAndRecordKeyframe((*kfit).second, dssim, psnr, psnr_gs, 
+            render_time, image_dir, opacity_dir, depth_dir, image_gt_dir, image_loss_dir, 
+            image_uw_dir, image_uw_at_dir, image_uw_bs_dir);
         out_time << (*kfit).first << " " << std::fixed << std::setprecision(8) << render_time << std::endl;
 
         out_dssim   << (*kfit).first << " " << std::fixed << std::setprecision(10) << dssim   << std::endl;

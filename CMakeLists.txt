@@ -118,6 +118,7 @@ target_link_libraries(imgui glfw OpenGL::GL)
 add_library(gaussian_mapper SHARED
     third_party/tinyply/tinyply.h
     third_party/tinyply/tinyply.cpp
+    include/uw_models.h
     include/gaussian_keyframe.h
     include/gaussian_model.h
     include/gaussian_parameters.h
@@ -136,6 +137,7 @@ add_library(gaussian_mapper SHARED
     include/point2d.h
     include/point3d.h
     include/types.h
+    src/uw_models.cpp
     src/gaussian_keyframe.cpp
     src/gaussian_model.cpp
     src/gaussian_parameters.cpp
