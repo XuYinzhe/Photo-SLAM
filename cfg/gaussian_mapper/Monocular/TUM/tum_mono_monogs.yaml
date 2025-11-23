@@ -55,7 +55,7 @@ Record.record_loop_ply: 0 # 0:false, 1 or other integer:true
 #--------------------------------------------------------------------------------------------
 
 # Learning rate
-Optimization.max_num_iterations: 8100
+Optimization.max_num_iterations: 30100
 Optimization.position_lr_init: 0.00032 #0.00016
 Optimization.position_lr_final: 0.00032
 Optimization.position_lr_delay_mult: 0.01
@@ -80,7 +80,7 @@ Optimization.densify_until_iter: 30000
 Optimization.densify_grad_threshold: 0.001
 
 #uw
-Optimization.enable_uw: 0  # 0:false, 1 or other integer:true
+Optimization.enable_uw: 1  # 0:false, 1 or other integer:true
 Optimization.bs_at_lr: 0.04
 
 #--------------------------------------------------------------------------------------------

@@ -1751,9 +1751,9 @@ void GaussianMapper::renderAndRecordKeyframe(
     torch::Tensor uw_image, uw_at_image, uw_bs_image, masked_uw_image;
     if(opt_params_.enable_uw_){
         auto rendered_depth_norm = uw::normalize_depth(rendered_depth, rendered_opacity);
-        uw_at_image = rendered_image * this->attenuate_net_->forward(rendered_depth_norm);
+        uw_at_image = this->attenuate_net_->forward(rendered_depth_norm);
         uw_bs_image = this->backscatter_net_->forward(rendered_depth_norm);
-        uw_image = torch::clamp(uw_at_image + uw_bs_image, 0.0f, 1.0f);
+        uw_image = torch::clamp(rendered_image * uw_at_image + uw_bs_image, 0.0f, 1.0f);
         masked_uw_image = uw_image * undistort_mask_[pkf->camera_id_];
     }
     torch::cuda::synchronize();
