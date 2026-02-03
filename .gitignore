@@ -1,6 +1,6 @@
 data
 ./results
-*.txt
+log*
 
 # Prerequisites
 *.d
