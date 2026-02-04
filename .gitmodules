@@ -1,0 +1,10 @@
+[submodule "third_party/GMS-Feature-Matcher"]
+    path = third_party/GMS-Feature-Matcher
+    url = https://github.com/JiawangBian/GMS-Feature-Matcher.git
+    branch = master
+
+[submodule "third_party/Connected_components_PyTorch"]
+    path = third_party/Connected_components_PyTorch
+    url = https://github.com/XuYinzhe/Connected_components_PyTorch.git
+    branch = main
+

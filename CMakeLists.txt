@@ -23,6 +23,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS} -pthread")
 # set(ENV{CUDA_LAUNCH_BLOCKING} 1)
 # set(ENV{TORCH_USE_CUDA_DSA} 1)
 
+set(CUDA_VERSION 11.8)
 find_package(CUDA REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV 4 REQUIRED)
@@ -89,6 +90,27 @@ target_link_libraries(cuda_rasterizer
     Eigen3::Eigen)
 
 ##################################################################################
+##  Build the cc_torch connected components library
+##################################################################################
+
+set(CC_TORCH_SRC_DIR ${PROJECT_SOURCE_DIR}/third_party/Connected_components_PyTorch/cpp)
+
+add_library(cc_torch SHARED
+    ${CC_TORCH_SRC_DIR}/buf.h
+    ${CC_TORCH_SRC_DIR}/buf.cu)
+
+set_target_properties(cc_torch PROPERTIES CUDA_ARCHITECTURES "75;86")
+
+target_include_directories(cc_torch PUBLIC
+    ${CC_TORCH_SRC_DIR}
+    ${TORCH_INCLUDE_DIRS}
+)
+
+target_link_libraries(cc_torch PUBLIC
+    ${TORCH_LIBRARIES}
+)
+
+##################################################################################
 ##  Build the ImGui library to ${PROJECT_SOURCE_DIR}/lib
 ##################################################################################
 
@@ -131,6 +153,7 @@ add_library(gaussian_mapper SHARED
     include/loss_utils.h
     include/sh_utils.h
     include/tensor_utils.h
+    include/metrics_utils.h
     include/camera.h
     include/point_cloud.h
     include/point2d.h
@@ -151,7 +174,8 @@ target_link_libraries(gaussian_mapper
     "${TORCH_LIBRARIES}"
     Eigen3::Eigen
     simple_knn
-    cuda_rasterizer)
+    cuda_rasterizer
+    cc_torch)
 
 ##################################################################################
 ##  Build the viewer library to ${PROJECT_SOURCE_DIR}/lib
@@ -175,71 +199,12 @@ target_link_libraries(gaussian_viewer
     OpenGL::GL)
 
 ##################################################################################
-##  Build the test examples to ${PROJECT_SOURCE_DIR}/bin
-##################################################################################
-
-# This is a C++ libtorch implementation of gaussian-splatting (https://github.com/graphdeco-inria/gaussian-splatting)
-add_executable(train_colmap examples/train_colmap.cpp)
-target_link_libraries(train_colmap
-    gaussian_viewer
-    gaussian_mapper)
-
-add_executable(view_result examples/view_result.cpp)
-target_link_libraries(view_result
-    gaussian_viewer
-    gaussian_mapper)
-
-##################################################################################
 ##  Build the mapping examples to ${PROJECT_SOURCE_DIR}/bin
 ##################################################################################
 
-# Replica Monocular
-add_executable(replica_mono examples/replica_mono.cpp)
-target_link_libraries(replica_mono
+add_executable(align_hrlr examples/align_hrlr.cpp)
+target_link_libraries(align_hrlr
     gaussian_viewer    
     gaussian_mapper
     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
 
-# Replica Monocular
-add_executable(replica_rgbd examples/replica_rgbd.cpp)
-target_link_libraries(replica_rgbd
-    gaussian_viewer    
-    gaussian_mapper
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
-
-# TUM Monocular
-add_executable(tum_mono examples/tum_mono.cpp)
-target_link_libraries(tum_mono
-    gaussian_viewer    
-    gaussian_mapper
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
-
-# TUM RGBD
-add_executable(tum_rgbd examples/tum_rgbd.cpp)
-target_link_libraries(tum_rgbd
-    gaussian_viewer    
-    gaussian_mapper
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
-
-# EuRoC Stereo
-add_executable(euroc_stereo examples/euroc_stereo.cpp)
-target_link_libraries(euroc_stereo
-    gaussian_viewer    
-    gaussian_mapper
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
-
-##################################################################################
-##  Build the mapping examples to ${PROJECT_SOURCE_DIR}/bin
-##################################################################################
-
-# Intel Realsense
-if(realsense2_FOUND)
-    add_executable(realsense_rgbd examples/realsense_rgbd.cpp)
-    target_include_directories(realsense_rgbd PUBLIC
-        ${realsense_INCLUDE_DIR})
-    target_link_libraries(realsense_rgbd
-        gaussian_viewer    
-        gaussian_mapper
-        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-        ${realsense2_LIBRARY})
-endif()
