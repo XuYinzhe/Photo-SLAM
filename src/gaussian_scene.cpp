@@ -45,6 +45,7 @@ void GaussianScene::addKeyframe(std::shared_ptr<GaussianKeyframe> new_kf, bool* 
 {
     std::unique_lock<std::mutex> lock_kfs(this->mutex_kfs_);
     this->keyframes_.emplace(new_kf->fid_, new_kf);
+    this->keyframes_ids_.push_back(new_kf->fid_);
     *shuffled = false;
 }
 
@@ -87,6 +88,10 @@ Point3D& GaussianScene::getPoint3D(point3D_id_t point3DId)
 void GaussianScene::clearCachedPoint3D()
 {
     this->cached_point_cloud_.clear();
+}
+
+int GaussianScene::getPointNumber(){
+    return this->cached_point_cloud_.size();
 }
 
 void GaussianScene::applyScaledTransformation(

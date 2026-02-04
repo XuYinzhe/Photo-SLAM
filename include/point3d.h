@@ -30,6 +30,10 @@ public:
           error_(-1.0)
     {}
 
+    Point3D(double x, double y, double z, float r, float g, float b)
+        : xyz_(x, y, z), 
+          color_(r, g, b) {}
+
 public:
     Eigen::Vector3d xyz_;
 

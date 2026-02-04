@@ -37,7 +37,10 @@ public:
         GaussianPipelineParams& pipe,
         torch::Tensor& bg_color,
         torch::Tensor& override_color,
-        bool fix_gs = false,
+        bool has_hr = false,
+        bool has_fix_mean3d = false,
+        bool has_fix_gs_geo = false,
+        bool has_fix_gs_clr = false,
         float scaling_modifier = 1.0f,
         bool has_override_color = false);
 };

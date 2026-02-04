@@ -32,7 +32,11 @@
 #include <random>
 #include <mutex>
 
+#include <Eigen/Dense>
+#include <Eigen/Geometry>
+
 #include <opencv2/opencv.hpp>
+#include <opencv2/core/eigen.hpp>
 #include <opencv2/cudaimgproc.hpp>
 #include <opencv2/cudastereo.hpp>
 #include <opencv2/cudawarping.hpp>
@@ -40,11 +44,23 @@
 #include <jsoncpp/json/json.h>
 
 #include "ORB-SLAM3/include/System.h"
+#include "ORB-SLAM3/include/ORBVocabulary.h"
+#include "ORB-SLAM3/include/ORBextractor.h"
 #include "ORB-SLAM3/Thirdparty/Sophus/sophus/se3.hpp"
+
+#include "third_party/Connected_components_PyTorch/cpp/buf.h"
+
+// #include <pcl/point_types.h>
+// #include <pcl/point_cloud.h>
+// #include <pcl/filters/voxel_grid.h>
+// #include <pcl/filters/approximate_voxel_grid.h>
+// #include <fast_gicp/gicp/fast_vgicp.hpp>
+// #include <fast_gicp/gicp/fast_vgicp_cuda.hpp>
 
 #include "operate_points.h"
 #include "stereo_vision.h"
 #include "tensor_utils.h"
+#include "metrics_utils.h"
 #include "gaussian_keyframe.h"
 #include "gaussian_scene.h"
 #include "gaussian_trainer.h"
@@ -53,6 +69,19 @@
     if (!dir.empty() && !std::filesystem::exists(dir))                                      \
         if (!std::filesystem::create_directories(dir))                                      \
             throw std::runtime_error("Cannot create result directory at " + dir.string());
+
+using KeyframeFrontend = std::tuple<
+    unsigned long,    // pKF->mnId
+    unsigned long,    // pKF->mpCamera->GetId()
+    Sophus::SE3f,     // pKF->GetPose()
+    cv::Mat,          // pKF->imgLeftRGB.clone()
+    bool,             // isLoopClosureKF
+    cv::Mat,          // pKF->imgAuxiliary
+    std::vector<float>, // pixels
+    std::vector<float>, // pointsLocal
+    std::string         // pKF->mNameFile
+>;
+
 struct UndistortParams
 {
     UndistortParams(
@@ -163,6 +192,11 @@ public:
     void setColmapDataPath(std::filesystem::path colmap_path) { this->model_params_.source_path_ = colmap_path; }
     void setSensorType(SystemSensorType sensor_type) { this->sensor_type_ = sensor_type; }
 
+    void setOtherData(const std::vector<std::string>& paths, 
+        const std::vector<double>& timestamps = {},
+        const std::vector<std::vector<double>>& lr_gt_poses = {},
+        const std::vector<std::vector<double>>& hr_gt_poses = {});
+
     void loadPly(std::filesystem::path ply_path, std::filesystem::path camera_path = "");
 
 protected:
@@ -192,6 +226,74 @@ protected:
     // bool needInterruptTraining();
     // void setInterruptTraining(const bool interrupt_training);
 
+    // cv::Mat sampleDepthMap(const cv::Mat& depth);
+    // void cacheSampledDepthMap(std::shared_ptr<GaussianKeyframe> pkf, Sophus::SE3<float>& pose);
+    void cacheKeyframeDepthMap();
+    cv::Mat getDepthRelated(std::shared_ptr<GaussianKeyframe> pkf1, std::shared_ptr<GaussianKeyframe> pkf2, 
+        Sophus::SE3f pose1, Sophus::SE3f pose2);
+    cv::Mat getDepthRelated(std::shared_ptr<GaussianKeyframe> pkf1, std::shared_ptr<GaussianKeyframe> pkf2, 
+        torch::Tensor pose1, torch::Tensor pose2, torch::Tensor give_depth);
+    cv::Mat getDepthDiff(std::shared_ptr<GaussianKeyframe> pkf1, std::shared_ptr<GaussianKeyframe> pkf2, 
+        bool give_poses = false, Sophus::SE3f pose1 = Sophus::SE3f(), Sophus::SE3f pose2 = Sophus::SE3f());
+    cv::Mat getDepthDiff(std::shared_ptr<GaussianKeyframe> pkf1, std::shared_ptr<GaussianKeyframe> pkf2, 
+        torch::Tensor pose1, torch::Tensor pose2);
+
+    void optimizeGlobalAlign();
+    void getAvgGlobalPose(std::vector<std::size_t>& kfids, bool soften = false, float soften_ratio = 0.1f);
+    void getAvgGlobalPose(std::vector<std::size_t>& kfids, torch::Tensor& avg_pose, bool soften = false, float soften_ratio = 0.1f);
+
+    float getRelatedPoseGMS(std::shared_ptr<GaussianKeyframe> pkf, 
+        const std::vector<cv::KeyPoint>& kpts1,
+        const std::vector<cv::KeyPoint>& kpts2,
+        const std::vector<int>& match12,
+        const cv::Mat& depth1,
+        const cv::Mat& K2,
+        cv::Mat& rvec, cv::Mat& tvec, 
+        std::vector<int>& inliers,
+        bool is_lr = true,
+        float hr_resize_ratio = 1.0f,
+        bool use_lr2hr_depth = false
+    );
+
+    // torch::Tensor refinePoseFastVGICP(std::shared_ptr<GaussianKeyframe> pkf);
+
+    std::size_t handleKeyframeFrontend(KeyframeFrontend& kf, std::shared_ptr<GaussianKeyframe> new_kf, float timestamp);
+    float getRsizedHRScale(float ratio, int& out_width, int& out_height);
+    // current methods only use diff or classic, ours hyper robust to more situations, for tracking contribution
+    void getBatchShuffledFrameIds(const std::vector<std::size_t>& in_fids, std::vector<std::size_t>& out_fids, int required_iters);
+    float optimizeGlobalLRPose(std::shared_ptr<GaussianKeyframe> pkf, bool use_differential_pose = true);
+    float optimizeGlobalLRImg(std::shared_ptr<GaussianKeyframe> pkf, int i);
+    float optimizeGlobalHRPose(std::shared_ptr<GaussianKeyframe> pkf, bool use_differential_pose = true);
+    float optimizeLocalLRPose(std::shared_ptr<GaussianKeyframe> pkf, bool use_differential_pose = true);
+    float optimizeLocalHRPose(std::shared_ptr<GaussianKeyframe> pkf, bool use_differential_pose = true);
+    torch::Tensor getLocalLRValidDptMsk(std::shared_ptr<GaussianKeyframe> pkf);
+    int insertLocalLRValidDpts(std::vector<torch::Tensor>& valid_depth_masks, std::vector<std::size_t>& valid_fids);
+    void optimizeInsertedLocalLRDpts(std::vector<std::size_t>& valid_fids);
+    void insertLocalLRValidDpt(std::shared_ptr<GaussianKeyframe> pkf);
+    float optimizeLocalHRImgs(std::vector<std::size_t>& random_kfids, std::vector<std::size_t>& valid_fids);
+    float optimizeLocalHRImg(std::shared_ptr<GaussianKeyframe> pkf);
+
+    void insertNewKeyframesFromSLAM();
+    // void insertOneKeyframe(std::tuple<
+    //     unsigned long,
+    //     unsigned long,
+    //     Sophus::SE3f,
+    //     cv::Mat,
+    //     bool,
+    //     cv::Mat,
+    //     std::vector<float>,
+    //     std::vector<float>,
+    //     std::string> &kf, double timestamp);
+    void insertOneKeyframe_old(KeyframeFrontend& kf, double timestamp);
+    void insertOneKeyframe(KeyframeFrontend& kf, double timestamp);
+    void insertBatchKeyframes(
+        std::vector<std::shared_ptr<KeyframeFrontend>>& kfs, 
+        std::vector<double>& timestamps);
+
+    // void undistortKeyframe(std::shared_ptr<GaussianKeyframe> pkf, std::size_t camera_id);
+    void generatePyramidSizes(std::shared_ptr<GaussianKeyframe> pkf, const Camera& camera);
+    void generatePyramidFrames(std::shared_ptr<GaussianKeyframe> pkf);
+
     void recordKeyframeRendered(
         torch::Tensor &rendered_image,
         torch::Tensor &rendered_opacity,
@@ -219,7 +321,7 @@ protected:
     void renderAndRecordAllKeyframes(
         std::string name_suffix = "");
 
-    void savePly(std::filesystem::path result_dir);
+    void savePly(std::filesystem::path result_dir, bool save_sparse = true);
     void keyframesToJson(std::filesystem::path result_dir);
     void saveModelParams(std::filesystem::path result_dir);
     void writeKeyframeUsedTimes(std::filesystem::path result_dir, std::string name_suffix = "");
@@ -254,12 +356,15 @@ public:
     std::map<camera_id_t, torch::Tensor> undistort_mask_;
     std::map<camera_id_t, torch::Tensor> viewer_main_undistort_mask_;
     std::map<camera_id_t, torch::Tensor> viewer_sub_undistort_mask_;
+    
+    torch::Tensor hr_undistort_mask_;
 
 protected:
     // Parameters
     GaussianModelParams model_params_;
     GaussianOptimizationParams opt_params_;
     GaussianPipelineParams pipe_params_;
+    KeyframeOptimizationParams kf_params_;
 
     // Data
     std::map<std::size_t, std::shared_ptr<GaussianKeyframe>> viewpoint_sliding_window_;
@@ -311,6 +416,75 @@ protected:
 
     bool do_gaus_pyramid_training_;
 
+    // dense mapping initialization
+    torch::Tensor dense_init_pcd_xyz_, dense_init_pcd_rgb_, dense_init_pcd_idx_;
+    bool dense_map_points_;
+    float dense_sample_num_; // deprecated
+    int dense_height_num_, dense_width_num_; // deprecated
+    float dense_diff_thld_;
+    float dense_diff_thld_ratio_;
+    int dense_fid_offset_ = 2;
+    std::vector<std::size_t> dense_init_fids_;
+    // std::vector<std::unordered_map<int, int>> dense_init_fids_valid_pixels_;
+    std::unordered_map<int, int> dense_init_fid_valid_pixels_;
+    Eigen::ArrayXf dense_height_map_, dense_width_map_;
+    torch::Tensor dense_height_map_tensor_, dense_width_map_tensor_;
+
+    // global alignment
+    int init_train_iter_;
+    int max_pnp_render_attempts_ = 3;
+    int global_align_lr_pose_iter_;
+    int global_align_lr_iter_;
+    float global_align_lr_depth_lambda_;
+    float global_align_lr_fix_mean3d_thld_ = 0.1f;
+    int global_align_hr_iter_;
+    int global_align_hr_warmup_iter_;
+    float global_align_hr_warmup_lr_dump_;
+    float global_align_hr_resize_ratio_;
+    float global_align_time_window_ratio_;
+    float global_align_opacity_thr_;
+    float global_align_hr_opacity_thr_;
+    float global_align_hr_pose_lambda_;
+    float global_align_hr_pose_reg_lambda_;
+    float global_align_hr_pose_depth_lambda_;
+    int global_align_hr_pose_iter_;
+    std::vector<int> global_align_select_fids_;
+    int global_align_hr_color_iter_;
+    float global_align_hr_color_lambda_;
+
+    // local alignment
+    std::vector<std::map<ORB_SLAM3::MappingOperation::OprType, std::vector<std::size_t>>> local_mapping_operations_;
+    int local_align_lr_pose_iter_;
+    int local_align_lr_iter_;
+    float local_align_lr_opcacity_thr_;
+    float local_align_hr_resize_ratio_;
+    int local_align_lr_joint_pose_iter_;
+    float local_align_lr_joint_pose_dump_;
+    int local_align_hr_pose_iter_;
+    float local_align_hr_opacity_thr_;
+    float local_align_hr_pose_reg_lambda_;
+    float local_align_hr_pose_opacity_lambda_;
+    float local_align_hr_pose_depth_lambda_;
+    int local_align_hr_color_iter_;
+    float local_align_hr_color_loss_thr_;
+    int local_align_batch_size_;
+    std::unordered_map<std::size_t, double> local_align_batch_fids_timestamps_map_;
+    float local_align_batch_fillholes_opacity_thr_;
+    int local_align_batch_conn_comp_min_size_;
+    int local_align_batch_color_periter_;
+
+    // gt related
+    std::vector<std::string> vstrHRImagePaths_;
+    std::vector<double> vHRTimestamps_;
+    std::vector<std::vector<double>> vvLRGTPose_;
+    std::vector<std::vector<double>> vvHRGTPose_;
+    bool hr_timestamps_exist_ = false;
+    bool gt_pose_exist_ = false;
+    std::vector<std::size_t> global_algin_fids_;
+    float global_align_time_ = 0.f;
+    torch::Tensor global_align_pose_;
+
+    // recording
     std::filesystem::path result_dir_;
     int keyframe_record_interval_;
     int all_keyframes_record_interval_;
@@ -330,6 +504,7 @@ protected:
 
     // Tools
     std::random_device rd_;
+    std::shared_ptr<torch::jit::script::Module> lpips_model_;
 
     // Mutex
     std::mutex mutex_status_;

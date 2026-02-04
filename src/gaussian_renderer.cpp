@@ -29,7 +29,10 @@ GaussianRenderer::render(
     GaussianPipelineParams& pipe,
     torch::Tensor& bg_color,
     torch::Tensor& override_color,
-    bool fix_gs,
+    bool has_hr,
+    bool has_fix_mean3d,
+    bool has_fix_gs_geo,
+    bool has_fix_gs_clr,
     float scaling_modifier,
     bool use_override_color)
 {
@@ -39,7 +42,7 @@ GaussianRenderer::render(
      */
 
     // Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    auto screenspace_points = torch::zeros_like(pc->getXYZ(),
+    auto screenspace_points = torch::zeros_like(pc->getXYZ(viewpoint_camera),
         torch::TensorOptions().dtype(pc->getXYZ().dtype()).requires_grad(true).device(torch::kCUDA));
     try {
         screenspace_points.retain_grad();
@@ -49,10 +52,18 @@ GaussianRenderer::render(
     }
 
     // Set up rasterization configuration
-    float tanfovx = std::tan(viewpoint_camera->FoVx_ * 0.5f);
-    float tanfovy = std::tan(viewpoint_camera->FoVy_ * 0.5f);
+    float tanfovx, tanfovy;
+    if(viewpoint_camera->kf_params_->align_pose_ && viewpoint_camera->kf_params_->render_aligned_ && has_hr){
+        tanfovx = std::tan(viewpoint_camera->kf_params_->hr_fovx_ * 0.5f);
+        tanfovy = std::tan(viewpoint_camera->kf_params_->hr_fovy_ * 0.5f);
+    }
+    else
+    {
+        tanfovx = std::tan(viewpoint_camera->FoVx_ * 0.5f);
+        tanfovy = std::tan(viewpoint_camera->FoVy_ * 0.5f);
+    }
 
-    viewpoint_camera->updateRenderMatrix();
+    viewpoint_camera->updateRenderMatrix(has_hr);
 
     GaussianRasterizationSettings raster_settings(
         image_height,
@@ -71,9 +82,12 @@ GaussianRenderer::render(
 
     GaussianRasterizer rasterizer(raster_settings);
 
-    auto means3D = pc->getXYZ();
+    auto means3D = pc->getXYZ(viewpoint_camera);
+    if(has_fix_mean3d) means3D = means3D.detach(); 
     auto means2D = screenspace_points;
-    auto opacity = pc->getOpacityActivation();
+    if(has_fix_mean3d) means2D = means2D.detach();
+    auto opacities = pc->getOpacityActivation(viewpoint_camera);
+    if(has_fix_gs_geo) opacities = opacities.detach();
 
     /* If precomputed 3d covariance is provided, use it. If not, then it will be computed from
        scaling / rotation by the rasterizer. 
@@ -88,9 +102,11 @@ GaussianRenderer::render(
         cov3D_precomp = pc->getCovarianceActivation();
         has_cov3D_precomp = true;
     }
-    else {
-        scales = pc->getScalingActivation();
-        rotations = pc->getRotationActivation();
+    else { // main
+        scales = pc->getScalingActivation(viewpoint_camera);
+        if(has_fix_gs_geo) scales = scales.detach();
+        rotations = pc->getRotationActivation(viewpoint_camera);
+        if(has_fix_gs_geo) rotations = rotations.detach();
         has_scales = true;
         has_rotations = true;
     }
@@ -116,25 +132,18 @@ GaussianRenderer::render(
             colors_precomp = torch::clamp_min(sh2rgb + 0.5, 0.0);
             has_color_precomp = true;
         }
-        else {
-            shs = pc->getFeatures();
+        else { // main
+            shs = pc->getFeatures(viewpoint_camera);
+            if(has_fix_gs_clr) shs = shs.detach();
             has_shs = true;
         }
-    }
-
-    if(fix_gs){
-        means3D = means3D.detach();
-        opacity = opacity.detach();
-        scales = scales.detach();
-        rotations = rotations.detach();
-        shs = shs.detach();
     }
 
     // Rasterize visible Gaussians to image, obtain their radii (on screen). 
     auto rasterizer_result = rasterizer.forward(
         means3D,
         means2D,
-        opacity,
+        opacities,
         has_shs,
         has_color_precomp,
         has_scales,
@@ -148,11 +157,10 @@ GaussianRenderer::render(
         viewpoint_camera->theta_,
         viewpoint_camera->rho_
     );
-
     auto rendered_image = std::get<0>(rasterizer_result);
     auto radii = std::get<1>(rasterizer_result);
     auto depth = std::get<2>(rasterizer_result);
-    auto opacities = std::get<3>(rasterizer_result);
+    auto opacity = std::get<3>(rasterizer_result);
     auto n_touched = std::get<4>(rasterizer_result);
 
     /* Those Gaussians that were frustum culled or had a radius of 0 were not visible.
@@ -164,7 +172,7 @@ GaussianRenderer::render(
         radii > 0,          /*visibility_filter*/
         radii,               /*radii*/
         depth,
-        opacities,
+        opacity,
         n_touched
     );
 }
