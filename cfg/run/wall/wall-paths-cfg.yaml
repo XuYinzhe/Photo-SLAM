@@ -1,0 +1,12 @@
+%YAML:1.0
+
+ORB-SLAM3.Vocabulary: "../ORB-SLAM3/Vocabulary/ORBvoc.txt"
+ORB-SLAM3.Parameters: "../cfg/run/wall/orb3-params-l515.yaml"
+
+Mapper.Parameters: "../cfg/gaussian_mapper/HRLR/wall.yaml"
+
+Dataset: "/home/shaun/Desktop/Photo-SLAM-dev/Photo-SLAM-monogs250918/align_dataset_wall4/data/"
+Dataset.fps: 10.0
+
+Results.Saving: "../results/wall4/0204"
+Results.Viewer: 0 # 0 for no viewer, otherwise for has viewer

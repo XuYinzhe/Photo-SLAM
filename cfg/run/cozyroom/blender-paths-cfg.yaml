@@ -1,0 +1,12 @@
+%YAML:1.0
+
+ORB-SLAM3.Vocabulary: "../ORB-SLAM3/Vocabulary/ORBvoc.txt"
+ORB-SLAM3.Parameters: "../cfg/run/cozyroom/orb3-params-320p.yaml"
+
+Mapper.Parameters: "../cfg/gaussian_mapper/HRLR/blender.yaml"
+
+Dataset: "/home/shaun/Downloads/blend_files-20250709T090007Z-1-001/rgbd-hr/20251017/"
+Dataset.fps: -1.0
+
+Results.Saving: "../results/a_rgbd/cozyroom/1023"
+Results.Viewer: 0 # 0 for no viewer, otherwise for has viewer
