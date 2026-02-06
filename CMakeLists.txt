@@ -1,4 +1,10 @@
 cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
+
+# force cuda 12.6 for cuvslam
+set(CUDA_TOOLKIT_ROOT_DIR "/usr/local/cuda-12.6")
+set(CMAKE_CUDA_COMPILER "${CUDA_TOOLKIT_ROOT_DIR}/bin/nvcc")
+set(CMAKE_CUDA_ARCHITECTURES "75;86")
+
 project(photo-slam LANGUAGES CXX CUDA)
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -23,21 +29,27 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS} -pthread")
 # set(ENV{CUDA_LAUNCH_BLOCKING} 1)
 # set(ENV{TORCH_USE_CUDA_DSA} 1)
 
-set(CUDA_VERSION 11.8)
-find_package(CUDA REQUIRED)
+# find_package(CUDA REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV 4 REQUIRED)
 find_package(jsoncpp REQUIRED)
 
 find_package(OpenGL REQUIRED)
-find_package(glm REQUIRED)
+# find_package(glm REQUIRED) # original: /usr/lib/cmake/glm
 find_package(glfw3 REQUIRED)
-
-find_package(realsense2)
 
 set(ORB_SLAM3_SOURCE_DIR "${PROJECT_SOURCE_DIR}/ORB-SLAM3")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/lib)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/bin)
+
+# add glm if cannot find automatically
+set(GLM_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/glm")
+if(NOT TARGET glm::glm)
+    add_library(glm INTERFACE)
+    target_include_directories(glm INTERFACE ${GLM_INCLUDE_DIR})
+    add_library(glm::glm ALIAS glm)
+    message(STATUS "Defined manual glm::glm target")
+endif()
 
 include_directories(
     ${PROJECT_SOURCE_DIR}
@@ -111,6 +123,20 @@ target_link_libraries(cc_torch PUBLIC
 )
 
 ##################################################################################
+##  Build the cuvslam library to ${PROJECT_SOURCE_DIR}/lib
+##################################################################################
+
+set(CUVSLAM_DIR ${PROJECT_SOURCE_DIR}/third_party/cuvlsam)
+set(CUVSLAM_INCLUDE_DIR ${CUVSLAM_DIR}/include)
+set(CUVSLAM_LIB_DIR ${CUVSLAM_DIR}/lib)
+set(CUVSLAM_LIB ${CUVSLAM_LIB_DIR}/libcuvslam.so)
+
+add_library(cuvslam SHARED IMPORTED)
+set_target_properties(cuvslam PROPERTIES
+    IMPORTED_LOCATION ${CUVSLAM_LIB}
+    INTERFACE_INCLUDE_DIRECTORIES ${CUVSLAM_INCLUDE_DIR})
+
+##################################################################################
 ##  Build the ImGui library to ${PROJECT_SOURCE_DIR}/lib
 ##################################################################################
 
@@ -166,7 +192,8 @@ add_library(gaussian_mapper SHARED
     src/gaussian_renderer.cpp
     src/gaussian_scene.cpp
     src/gaussian_trainer.cpp
-    src/gaussian_mapper.cpp)
+    src/gaussian_mapper.cpp
+)
 target_link_libraries(gaussian_mapper
     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
     ${OpenCV_LIBRARIES}
@@ -175,7 +202,12 @@ target_link_libraries(gaussian_mapper
     Eigen3::Eigen
     simple_knn
     cuda_rasterizer
-    cc_torch)
+    cc_torch
+    cuvslam
+)
+target_include_directories(gaussian_mapper PUBLIC
+    ${CUVSLAM_INCLUDE_DIR}
+)
 
 ##################################################################################
 ##  Build the viewer library to ${PROJECT_SOURCE_DIR}/lib
@@ -208,3 +240,9 @@ target_link_libraries(align_hrlr
     gaussian_mapper
     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
 
+add_executable(test_cuvslam examples/test_cuvslam.cpp)
+target_link_libraries(
+    test_cuvslam
+    ${CUVSLAM_LIB}
+    ${OpenCV_LIBRARIES}
+)
