@@ -1,19 +1,19 @@
 [submodule "third_party/GMS-Feature-Matcher"]
-    path = third_party/GMS-Feature-Matcher
-    url = https://github.com/JiawangBian/GMS-Feature-Matcher.git
-    branch = master
+	path = third_party/GMS-Feature-Matcher
+	url = https://github.com/JiawangBian/GMS-Feature-Matcher.git
+	branch = master
 
 [submodule "third_party/Connected_components_PyTorch"]
-    path = third_party/Connected_components_PyTorch
-    url = https://github.com/XuYinzhe/Connected_components_PyTorch.git
-    branch = main
+	path = third_party/Connected_components_PyTorch
+	url = https://github.com/XuYinzhe/Connected_components_PyTorch.git
+	branch = main
 
 [submodule "third_party/simple-knn"]
-    path = third_party/simple-knn
-    url = https://github.com/camenduru/simple-knn.git
-    branch = main
+	path = third_party/simple-knn
+	url = https://github.com/camenduru/simple-knn.git
+	branch = main
 
 [submodule "third_party/glm"]
-    path = third_party/glm
-    url = https://github.com/g-truc/glm.git
-    branch = master
+	path = third_party/glm
+	url = https://github.com/g-truc/glm.git
+	branch = master
