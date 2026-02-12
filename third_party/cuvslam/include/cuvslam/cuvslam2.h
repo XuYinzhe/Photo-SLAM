@@ -808,7 +808,8 @@ public:
    * @throws std::invalid_argument if `gt_pose` is passed incorrectly
    * @return On success `Pose` contains rig pose estimated by SLAM
    */
-  Pose Track(const Odometry::State& state, const Pose* gt_pose = nullptr);
+  Pose Track(const Odometry::State& state);
+  // Pose Track(const Odometry::State& state, const Pose* gt_pose = nullptr);
 
   /**
    * Set rig pose estimated by a user.
