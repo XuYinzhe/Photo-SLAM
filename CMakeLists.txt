@@ -1,8 +1,7 @@
 cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 
-# force cuda 12.6 for cuvslam
-set(CUDA_TOOLKIT_ROOT_DIR "/usr/local/cuda-12.6")
-set(CMAKE_CUDA_COMPILER "${CUDA_TOOLKIT_ROOT_DIR}/bin/nvcc")
+# if not specified, will report the error: 
+# CUDA_ARCHITECTURES is empty for target "cmTC_bf637". 
 set(CMAKE_CUDA_ARCHITECTURES "75;86")
 
 project(photo-slam LANGUAGES CXX CUDA)
@@ -126,7 +125,7 @@ target_link_libraries(cc_torch PUBLIC
 ##  Build the cuvslam library to ${PROJECT_SOURCE_DIR}/lib
 ##################################################################################
 
-set(CUVSLAM_DIR ${PROJECT_SOURCE_DIR}/third_party/cuvlsam)
+set(CUVSLAM_DIR ${PROJECT_SOURCE_DIR}/third_party/cuvslam)
 set(CUVSLAM_INCLUDE_DIR ${CUVSLAM_DIR}/include)
 set(CUVSLAM_LIB_DIR ${CUVSLAM_DIR}/lib)
 set(CUVSLAM_LIB ${CUVSLAM_LIB_DIR}/libcuvslam.so)
@@ -135,6 +134,32 @@ add_library(cuvslam SHARED IMPORTED)
 set_target_properties(cuvslam PROPERTIES
     IMPORTED_LOCATION ${CUVSLAM_LIB}
     INTERFACE_INCLUDE_DIRECTORIES ${CUVSLAM_INCLUDE_DIR})
+
+##################################################################################
+##  Build the cuvslam tracker library to ${PROJECT_SOURCE_DIR}/lib
+##################################################################################
+
+add_library(cuvslam_tracker SHARED
+    include/cuvslam_tracker.h
+    src/cuvslam_tracker.cpp)
+
+target_include_directories(cuvslam_tracker PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+    ${CUVSLAM_INCLUDE_DIR}
+    ${OpenCV_INCLUDE_DIRS}
+    ${EIGEN3_INCLUDE_DIR}
+)
+
+target_link_libraries(cuvslam_tracker PUBLIC
+    cuvslam
+    ${OpenCV_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+set_target_properties(cuvslam_tracker PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)
 
 ##################################################################################
 ##  Build the ImGui library to ${PROJECT_SOURCE_DIR}/lib
@@ -203,7 +228,7 @@ target_link_libraries(gaussian_mapper
     simple_knn
     cuda_rasterizer
     cc_torch
-    cuvslam
+    cuvslam_tracker
 )
 target_include_directories(gaussian_mapper PUBLIC
     ${CUVSLAM_INCLUDE_DIR}
@@ -240,9 +265,26 @@ target_link_libraries(align_hrlr
     gaussian_mapper
     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
 
+add_executable(align_hrlr_cuvslam examples/align_hrlr_cuvslam.cpp)
+target_link_libraries(align_hrlr_cuvslam
+    gaussian_viewer    
+    gaussian_mapper
+    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+    cuvslam_tracker
+    ${OpenCV_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
 add_executable(test_cuvslam examples/test_cuvslam.cpp)
 target_link_libraries(
     test_cuvslam
     ${CUVSLAM_LIB}
     ${OpenCV_LIBRARIES}
+)
+
+add_executable(test_cuvslam_tracker examples/test_cuvslam_tracker.cpp)
+target_link_libraries(test_cuvslam_tracker
+    cuvslam_tracker
+    ${OpenCV_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
 )
