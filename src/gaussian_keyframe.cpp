@@ -32,8 +32,9 @@ void GaussianKeyframe::setPose(
     const double qz,
     const double tx,
     const double ty,
-    const double tz)
-{
+    const double tz,
+    bool inverse
+) {
     this->R_quaternion_.w() = qw;
     this->R_quaternion_.x() = qx;
     this->R_quaternion_.y() = qy;
@@ -43,7 +44,12 @@ void GaussianKeyframe::setPose(
     this->t_.y() = ty;
     this->t_.z() = tz;
 
-    this->Tcw_ = Sophus::SE3d(this->R_quaternion_, this->t_);
+    Sophus::SE3d Tcw = Sophus::SE3d(this->R_quaternion_, this->t_);
+    if(inverse){
+        Tcw = general_utils::convert_pose_cuvslam2orbslam(Tcw);
+    }
+
+    this->Tcw_ = Tcw;
     this->base_pose_ = tensor_utils::SE3f2TensorTransformation(this->Tcw_.cast<float>()).to(torch::kCUDA);
 
     this->set_pose_ = true;
@@ -51,13 +57,19 @@ void GaussianKeyframe::setPose(
 
 void GaussianKeyframe::setPose(
     const Eigen::Quaterniond& q,
-    const Eigen::Vector3d& t)
-{
+    const Eigen::Vector3d& t,
+    bool inverse
+) {
     this->R_quaternion_ = q;
     this->R_quaternion_.normalize();
     this->t_ = t;
 
-    this->Tcw_ = Sophus::SE3d(this->R_quaternion_, this->t_);
+    Sophus::SE3d Tcw = Sophus::SE3d(this->R_quaternion_, this->t_);
+    if(inverse){
+        Tcw = general_utils::convert_pose_cuvslam2orbslam(Tcw);
+    }
+
+    this->Tcw_ = Tcw;
     this->base_pose_ = tensor_utils::SE3f2TensorTransformation(this->Tcw_.cast<float>()).to(torch::kCUDA);
 
     this->set_pose_ = true;
@@ -273,7 +285,16 @@ torch::Tensor GaussianKeyframe::getGTHRImg(torch::Tensor& selection_indices, flo
     return img;
 }
 
-void GaussianKeyframe::setGTLRDpt(cv::Mat& depth_img){
+void GaussianKeyframe::setGTLRDpt(cv::Mat& depth_img, bool need_preprocess){
+    if(need_preprocess){ // raw image from cv::imread
+        if(depth_img.channels() != 1)
+            cv::cvtColor(depth_img, depth_img, cv::COLOR_BGR2GRAY);
+        if(depth_img.type() == CV_16UC1)
+            depth_img.convertTo(depth_img, CV_32F, 1.f/this->kf_params_->lr_depth_factor_, 0.f);
+        else
+            std::cout<<"[GaussianKeyframe::setGTLRDpt][warning] unexpected depth image type "<<depth_img.type()<<" for keyframe "<<this->fid_<<std::endl;
+    }
+
     this->img_auxiliary_undist_ = depth_img.clone();
 
     cv::Mat depth_nonzero_mask = (this->img_auxiliary_undist_ > 1e-5f);
@@ -291,8 +312,18 @@ void GaussianKeyframe::setGTLRDpt(cv::Mat& depth_img){
         this->depth_undist_valid_mask_ = this->depth_undist_valid_mask_.mul(this->kf_params_->lr_undistort_mask_);
 }
 
-void GaussianKeyframe::setGTLRImg(cv::Mat& color_img){
+void GaussianKeyframe::setGTLRImg(cv::Mat& color_img, bool need_preprocess){
+    if(need_preprocess){ // raw image from cv::imread
+        if(color_img.type() == CV_8UC3){
+            cv::cvtColor(color_img, color_img, cv::COLOR_BGR2RGB);
+            color_img.convertTo(color_img, CV_32FC3, 1.f/255.f, 0.f);
+        }
+        else
+            std::cout<<"[GaussianKeyframe::setGTLRImg][warning] unexpected color image type "<<color_img.type()<<" for keyframe "<<this->fid_<<std::endl;
+    }
+
     this->img_undist_ = color_img.clone();
+    this->original_image_ = tensor_utils::cvMat2TorchTensor_Float32(this->img_undist_, torch::kCUDA);
 
     cv::Mat mImGray; 
     cv::cvtColor(this->img_undist_, mImGray, cv::COLOR_BGR2GRAY);

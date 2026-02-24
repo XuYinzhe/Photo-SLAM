@@ -354,7 +354,13 @@ inline torch::Tensor merge_large_components(const torch::Tensor& labeled_mask, i
     auto merged = keep.index_select(0, flat.to(torch::kLong))
                         .view(labeled_mask.sizes())
                         .to(torch::kFloat32);
+    merged = (merged > 0.f).to(torch::kFloat32); // ensure binary mask
+
     return merged;
+}
+
+inline Sophus::SE3d convert_pose_cuvslam2orbslam(const Sophus::SE3d& T_wr_cuvslam) {
+    return T_wr_cuvslam.inverse();
 }
 
 } // namespace general_utils

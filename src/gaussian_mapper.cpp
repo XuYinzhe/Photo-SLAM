@@ -434,6 +434,225 @@ GaussianMapper::GaussianMapper(
     // std::cout<<test_torch2eigen<<std::endl;
 }
 
+GaussianMapper::GaussianMapper(
+    std::shared_ptr<CuVSLAMTracker> pSLAM,
+    std::filesystem::path gaussian_config_file_path,
+    std::filesystem::path result_dir,
+    int seed,
+    torch::DeviceType device_type)
+    : pCuVSLAM_(pSLAM),
+      initial_mapped_(false),
+      interrupt_training_(false),
+      stopped_(false),
+      iteration_(0),
+      ema_loss_for_log_(0.0f),
+      SLAM_ended_(false),
+      loop_closure_iteration_(false),
+      min_num_initial_map_kfs_(15UL),
+      large_rot_th_(1e-1f),
+      large_trans_th_(1e-2f),
+      training_report_interval_(0)
+{
+    //=== consistent to the other constructor
+    std::srand(seed);
+    torch::manual_seed(seed);
+
+    if (device_type == torch::kCUDA && torch::cuda::is_available()) {
+        std::cout << "[Gaussian Mapper]CUDA available! Training on GPU." << std::endl;
+        device_type_ = torch::kCUDA;
+        model_params_.data_device_ = "cuda";
+    }
+    else {
+        throw std::runtime_error("Please run on devices with cuda!");
+    }
+
+    result_dir_ = result_dir;
+    CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(result_dir)
+    this->kf_params_.result_dir_ = result_dir_;
+    config_file_path_ = gaussian_config_file_path;
+    readConfigFromFile(gaussian_config_file_path);
+
+    std::cout << "[Gaussian Mapper]Pose optimization: "<<kf_params_.align_pose_<< std::endl;
+    std::cout << "[Gaussian Mapper]Align pose between HR and LR: "<<kf_params_.render_aligned_<< std::endl;
+    std::cout << "[Gaussian Mapper]Please set `KeyframeOptimization.render_aligned: 1` for HR and LR together."<< std::endl;
+    std::cout << "[Gaussian Mapper]Please set `KeyframeOptimization.render_aligned: 0` for mono and rgbd."<< std::endl;
+
+    std::vector<float> bg_color;
+    if (model_params_.white_background_)
+        bg_color = {1.0f, 1.0f, 1.0f};
+    else
+        bg_color = {0.0f, 0.0f, 0.0f};
+    background_ = torch::tensor(bg_color,
+                    torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
+    
+    override_color_ = torch::empty(0, torch::TensorOptions().device(device_type_));
+
+    gaussians_ = std::make_shared<GaussianModel>(model_params_, this->kf_params_.debug_);
+    scene_ = std::make_shared<GaussianScene>(model_params_);
+
+    //=== updated for CuVSLAMTracker
+    if(!this->pCuVSLAM_){
+        // NO SLAM
+        return;
+    }
+
+    if (this->wait_frontend_finish_)
+        this->pCuVSLAM_->SetWaitFinishSlam();
+
+    // lr camera calibrate
+    this->pCuVSLAM_->GetCameraParameters(
+        kf_params_.lr_width_, kf_params_.lr_height_,
+        kf_params_.lr_fx_, kf_params_.lr_fy_,
+        kf_params_.lr_cx_, kf_params_.lr_cy_,
+        kf_params_.lr_fps_, this->rendered_depthmap_factor_
+    );
+
+    this->kf_params_.lr_depth_factor_ = this->rendered_depthmap_factor_;
+
+    cv::Mat lr_K = (
+        cv::Mat_<float>(3, 3)
+            << kf_params_.lr_fx_, 0.f, kf_params_.lr_cx_,
+                0.f, kf_params_.lr_fy_, kf_params_.lr_cy_,
+                0.f, 0.f, 1.f
+    );
+
+    Camera camera;
+    camera.camera_id_ = 0; // single camera for CuVSLAMTracker L515
+    camera.setModelId(Camera::CameraModelType::PINHOLE);  
+    camera.width_ = kf_params_.lr_width_;
+    camera.height_ = kf_params_.lr_height_;
+    camera.params_[0]/*fx*/= kf_params_.lr_fx_;
+    camera.params_[1]/*fy*/= kf_params_.lr_fy_;
+    camera.params_[2]/*cx*/= kf_params_.lr_cx_;
+    camera.params_[3]/*cy*/= kf_params_.lr_cy_;
+    camera.dist_coeff_ = cv::Mat::zeros(1, 4, CV_32F); // no distortion for CuVSLAMTracker L515
+
+    camera.initUndistortRectifyMapAndMask(lr_K, cv::Size(kf_params_.lr_width_, kf_params_.lr_height_), lr_K, true);
+    
+    std::vector<cv::Mat> undistort_mask_channels;
+    cv::split(camera.undistort_mask, undistort_mask_channels);
+    kf_params_.lr_undistort_mask_ = undistort_mask_channels[0];
+    kf_params_.lr_undistort_mask_ = (kf_params_.lr_undistort_mask_>(1.f-1e-4f));
+    kf_params_.lr_undistort_mask_.convertTo(kf_params_.lr_undistort_mask_, CV_32FC1, 1.0f/255.0f);
+    std::cout << "[Gaussian Mapper]LR undistort mask sum is set: kf_params_.lr_undistort_mask_" << std::endl;
+
+    this->undistort_mask_[camera.camera_id_] = tensor_utils::cvMat2TorchTensor_Float32(camera.undistort_mask, device_type_);
+
+    cv::Mat viewer_sub_undistort_mask;
+    int viewer_image_height_ = camera.height_ * rendered_image_viewer_scale_;
+    int viewer_image_width_ = camera.width_ * rendered_image_viewer_scale_;
+    cv::resize(camera.undistort_mask, viewer_sub_undistort_mask, cv::Size(viewer_image_width_, viewer_image_height_));
+    viewer_sub_undistort_mask_[camera.camera_id_] = tensor_utils::cvMat2TorchTensor_Float32(viewer_sub_undistort_mask, device_type_);
+
+    cv::Mat viewer_main_undistort_mask;
+    int viewer_image_height_main_ = camera.height_ * rendered_image_viewer_scale_main_;
+    int viewer_image_width_main_ = camera.width_ * rendered_image_viewer_scale_main_;
+    cv::resize(camera.undistort_mask, viewer_main_undistort_mask, cv::Size(viewer_image_width_main_, viewer_image_height_main_));
+    viewer_main_undistort_mask_[camera.camera_id_] = tensor_utils::cvMat2TorchTensor_Float32(viewer_main_undistort_mask, device_type_);
+
+    if (!viewer_camera_id_set_) {
+        viewer_camera_id_ = camera.camera_id_;
+        viewer_camera_id_set_ = true;
+    }
+
+    this->scene_->addCamera(camera);
+
+    // hr camera calibrate
+    std::cout << "[Gaussian Mapper]Setting HR camera intrinsics and undistort map..." << std::endl;
+    cv::Mat hr_K = (
+        cv::Mat_<float>(3, 3)
+        <<  kf_params_.hr_fx_, 0.f, kf_params_.hr_cx_,
+            0.f, kf_params_.hr_fy_, kf_params_.hr_cy_,
+            0.f, 0.f, 1.f);
+    cv::Mat hr_K2 = hr_K.clone();
+
+    cv::Mat hr_dist_coeff = (cv::Mat_<float>(1, 4) << 
+        kf_params_.hr_k1_, kf_params_.hr_k2_, kf_params_.hr_p1_, kf_params_.hr_p2_);
+
+    cv::initUndistortRectifyMap(
+        hr_K,
+        hr_dist_coeff,
+        cv::Mat::eye(3, 3, CV_32F),
+        hr_K2,
+        cv::Size(kf_params_.hr_width_, kf_params_.hr_height_),
+        CV_32F,
+        kf_params_.hr_undistort_map1_,
+        kf_params_.hr_undistort_map2_
+    );
+    
+    cv::Mat white(cv::Size(kf_params_.hr_width_, kf_params_.hr_height_), CV_32FC3, cv::Vec3f(1.0f, 1.0f, 1.0f));
+    cv::remap(white, kf_params_.hr_undistort_mask_,
+              kf_params_.hr_undistort_map1_, kf_params_.hr_undistort_map2_,
+              cv::InterpolationFlags::INTER_LINEAR);
+    kf_params_.lr_undistort_mask_tensor_ = tensor_utils::cvMat2TorchTensor_Float32(kf_params_.hr_undistort_mask_, device_type_);
+    
+    kf_params_.has_undistort_ = true;
+
+    std::cout << "[Gaussian Mapper]HR undistort mask sum is set: kf_params_.hr_undistort_mask_" << std::endl;
+
+    // orb
+    this->kf_params_.orb_vocabulary_ = new ORB_SLAM3::ORBVocabulary();
+    bool bVocLoad = this->kf_params_.orb_vocabulary_->loadFromTextFile(this->kf_params_.orb_vocab_path_);
+    if(!bVocLoad)
+        throw std::runtime_error("[Gaussian Mapper]Wrong path to ORB vocabulary: " + this->kf_params_.orb_vocab_path_);
+    else
+        std::cout << "[Gaussian Mapper]ORB vocabulary loaded for HR pose optimization!" << std::endl;
+
+    this->kf_params_.orb_extractor_lr_ = new ORB_SLAM3::ORBextractor(
+        this->pCuVSLAM_->orb_nFeatures_ * 10,
+        this->pCuVSLAM_->orb_scaleFactor_,
+        this->pCuVSLAM_->orb_nLevels_,
+        this->pCuVSLAM_->orb_iniThFAST_,
+        this->pCuVSLAM_->orb_minThFAST_
+    );
+    this->kf_params_.orb_extractor_hr_ = new ORB_SLAM3::ORBextractor(
+        this->pCuVSLAM_->orb_nFeatures_ * 20,
+        this->pCuVSLAM_->orb_scaleFactor_,
+        this->pCuVSLAM_->orb_nLevels_,
+        this->pCuVSLAM_->orb_iniThFAST_,
+        this->pCuVSLAM_->orb_minThFAST_
+    );
+    std::cout << "[Gaussian Mapper]Base feature points for ORB extraction: " << this->pCuVSLAM_->orb_nFeatures_ << std::endl;
+
+    this->kf_params_.orb_camera_lr_ = new ORB_SLAM3::Pinhole(
+        std::vector<float> {
+            kf_params_.lr_fx_,
+            kf_params_.lr_fy_,
+            kf_params_.lr_cx_,
+            kf_params_.lr_cy_
+        }
+    );
+    this->kf_params_.orb_camera_hr_ = new ORB_SLAM3::Pinhole(
+        std::vector<float> {
+            kf_params_.hr_fx_,
+            kf_params_.hr_fy_,
+            kf_params_.hr_cx_,
+            kf_params_.hr_cy_
+        }
+    );
+
+    // dense map points sampling
+    this->dense_width_map_ = Eigen::ArrayXf::LinSpaced(kf_params_.lr_width_, 
+        0, kf_params_.lr_width_-1).replicate(kf_params_.lr_height_, 1).reshaped<Eigen::RowMajor>();
+    this->dense_height_map_ = Eigen::ArrayXf::LinSpaced(kf_params_.lr_height_, 
+        0, kf_params_.lr_height_-1).replicate(1, kf_params_.lr_width_).reshaped<Eigen::RowMajor>();
+    this->dense_width_map_tensor_ = torch::arange(this->kf_params_.lr_width_, torch::kFloat32).unsqueeze(0).repeat({this->kf_params_.lr_height_, 1}).to(device_type_);
+    this->dense_height_map_tensor_ = torch::arange(this->kf_params_.lr_height_, torch::kFloat32).unsqueeze(1).repeat({1, this->kf_params_.lr_width_}).to(device_type_);
+    this->dense_width_map_tensor_ = this->dense_width_map_tensor_.flatten();
+    this->dense_height_map_tensor_ = this->dense_height_map_tensor_.flatten();
+
+    //=== other
+    this->lpips_model_= std::make_shared<torch::jit::script::Module>();
+
+}
+
+GaussianMapper::~GaussianMapper()
+{
+    if(this->pCuVSLAM_){
+        pCuVSLAM_->Shutdown();
+    }
+}
+
 void GaussianMapper::readConfigFromFile(std::filesystem::path cfg_path)
 {
     cv::FileStorage settings_file(cfg_path.string().c_str(), cv::FileStorage::READ);
@@ -572,6 +791,8 @@ void GaussianMapper::readConfigFromFile(std::filesystem::path cfg_path)
     densify_min_opacity_ =
         settings_file["Optimization.densify_min_opacity"].operator float();
 
+    wait_frontend_finish_ = 
+        (settings_file["Optimization.wait_frontend_finish"].operator int()) != 0;
     init_train_iter_ =
         settings_file["Optimization.init_train_iter"].operator int();
     global_align_lr_pose_iter_ =
@@ -921,43 +1142,6 @@ cv::Mat GaussianMapper::getDepthDiff(std::shared_ptr<GaussianKeyframe> pkf1, std
         pose2 = pkf2->getPosef();
     }
 
-    /*
-    auto R1_inv = pose1.inverse().rotationMatrix();
-    auto t1_inv = pose1.inverse().translation();
-    auto R2 = pose2.rotationMatrix();
-    auto t2 = pose2.translation();
-
-    int pixels_num = kf_params_.lr_width_ * kf_params_.lr_height_;
-    Eigen::Map<Eigen::ArrayXf> z1(reinterpret_cast<float*>(depth1.data), pixels_num);
-    Eigen::Map<Eigen::ArrayXf> z2_gt(reinterpret_cast<float*>(depth2.data), pixels_num);
-
-    // kf1 <- kf2
-    Eigen::ArrayXf x1 = (this->dense_width_map_ - kf_params_.lr_cx_) * z1 / kf_params_.lr_fx_;
-    Eigen::ArrayXf y1 = (this->dense_height_map_ - kf_params_.lr_cy_) * z1 / kf_params_.lr_fy_;
-    
-    Eigen::MatrixXf Pc1(3, pixels_num);
-    Pc1.row(0) = x1.eval().transpose();
-    Pc1.row(1) = y1.eval().transpose();
-    Pc1.row(2) = z1.eval().transpose();
-
-    Eigen::MatrixXf Pw1 = (R1_inv * Pc1).colwise() + t1_inv;
-    Eigen::MatrixXf Pc2 = (R2 * Pw1).colwise() + t2;
-
-    Eigen::ArrayXf z2 = Pc2.row(2).transpose().array();
-    Eigen::ArrayXf x2 = Pc2.row(0).transpose().array();
-    Eigen::ArrayXf y2 = Pc2.row(1).transpose().array();
-
-    Eigen::ArrayXf u2 = x2 * kf_params_.lr_fx_ / z2 + kf_params_.lr_cx_;
-    Eigen::ArrayXf v2 = y2 * kf_params_.lr_fy_ / z2 + kf_params_.lr_cy_;
-    
-    cv::Mat mapx(1, pixels_num, CV_32F, (void*)u2.data());
-    cv::Mat mapy(1, pixels_num, CV_32F, (void*)v2.data());
-    mapx = mapx.reshape(1, kf_params_.lr_height_);
-    mapy = mapy.reshape(1, kf_params_.lr_height_);
-
-    cv::Mat depth2_hat;
-    cv::remap(depth2, depth2_hat, mapx, mapy, cv::INTER_NEAREST, cv::BORDER_CONSTANT, 0);
-    */
     cv::Mat depth2_hat = this->getDepthRelated(pkf1, pkf2, pose1, pose2);
 
     const auto& depth1_premask = pkf1->img_auxiliary_undist_;
@@ -978,27 +1162,38 @@ cv::Mat GaussianMapper::getDepthDiff(std::shared_ptr<GaussianKeyframe> pkf1, std
     return this->getDepthDiff(pkf1, pkf2, true, se3f_pose1, se3f_pose2);
 }
 
-void GaussianMapper::cacheKeyframeDepthMap(){
-    std::sort(scene_->keyframes_ids_.begin(), scene_->keyframes_ids_.end());
+void GaussianMapper::cacheKeyframeDepthMap(std::vector<std::size_t> kfids){
+    std::cout<<"[Gaussian Mapper::cacheKeyframeDepthMap] Caching keyframe depth maps..."<<std::endl;
+    std::vector<std::size_t> keyframes_ids;
+    if (kfids.empty()) {
+        this->scene_->getKeyframeIds(keyframes_ids);
+    } else {
+        keyframes_ids = kfids;
+    }
+
+    for (auto id : keyframes_ids){
+        std::cout<<"[debug] caching depth for keyframe "<<id<<std::endl;
+    }
+
 
     int iid0, iid1, iid2;
     for(int i=this->dense_fid_offset_; i>=0; i--){
         iid0 = i;
-        iid1 = int(scene_->keyframes_ids_.size()/3.f) + i;
-        iid2 = int(scene_->keyframes_ids_.size()/3.f*2.f) + i;
-        if(iid2 < scene_->keyframes_ids_.size()) break;
+        iid1 = int(keyframes_ids.size()/3.f) + i;
+        iid2 = int(keyframes_ids.size()/3.f*2.f) + i;
+        if(iid2 < keyframes_ids.size()) break;
     }
 
-    std::size_t id0 = scene_->keyframes_ids_[iid0];
-    std::size_t id1 = scene_->keyframes_ids_[iid1];
-    std::size_t id2 = scene_->keyframes_ids_[iid2];
+    std::size_t id0 = keyframes_ids[iid0];
+    std::size_t id1 = keyframes_ids[iid1];
+    std::size_t id2 = keyframes_ids[iid2];
 
     this->dense_init_fids_.push_back(id0);
     this->dense_init_fids_.push_back(id1);
     this->dense_init_fids_.push_back(id2);
-    const auto& pkf0 = scene_->getKeyframe(id0);
-    const auto& pkf1 = scene_->getKeyframe(id1);
-    const auto& pkf2 = scene_->getKeyframe(id2);
+    const auto& pkf0 = this->scene_->getKeyframe(id0);
+    const auto& pkf1 = this->scene_->getKeyframe(id1);
+    const auto& pkf2 = this->scene_->getKeyframe(id2);
     const auto pose0 = pkf0->getPosef();
     const auto pose1 = pkf1->getPosef();
     const auto pose2 = pkf2->getPosef();
@@ -1023,15 +1218,19 @@ void GaussianMapper::cacheKeyframeDepthMap(){
     const auto& depth0 = pkf0->img_auxiliary_undist_;
     const auto& depth1 = pkf1->img_auxiliary_undist_;
     const auto& depth2 = pkf2->img_auxiliary_undist_;
-    const auto& depth0_valid_mask = pkf0->depth_undist_valid_mask_;
-    const auto& depth1_valid_mask = pkf1->depth_undist_valid_mask_;
-    const auto& depth2_valid_mask = pkf2->depth_undist_valid_mask_;
-    // cv::Mat depth0 = depth0_premask.mul(kf_params_.lr_undistort_mask_);
-    // cv::Mat depth1 = depth1_premask.mul(kf_params_.lr_undistort_mask_);
-    // cv::Mat depth2 = depth2_premask.mul(kf_params_.lr_undistort_mask_);
+    auto depth0_valid_mask = pkf0->depth_undist_valid_mask_.clone();
+    auto depth1_valid_mask = pkf1->depth_undist_valid_mask_.clone();
+    auto depth2_valid_mask = pkf2->depth_undist_valid_mask_.clone();
     const auto& rgb0_raw = pkf0->img_undist_;
     const auto& rgb1_raw = pkf1->img_undist_;
     const auto& rgb2_raw = pkf2->img_undist_;
+
+    // cv::Mat rand_mask(depth0_valid_mask.size(), CV_32F);
+    // cv::randu(rand_mask, 0.0f, 1.0f);
+    // cv::Mat mask = rand_mask > 0.92f;
+    // depth0_valid_mask.setTo(0.f, ~mask);
+    // depth1_valid_mask.setTo(0.f, ~mask);
+    // depth2_valid_mask.setTo(0.f, ~mask);
 
     int pixels_num = kf_params_.lr_width_ * kf_params_.lr_height_;
     Eigen::Map<Eigen::ArrayXf> depth0_eigen(reinterpret_cast<float*>(depth0.data), pixels_num);
@@ -1071,60 +1270,11 @@ void GaussianMapper::cacheKeyframeDepthMap(){
     float threshold_Pw0_to_Pw2 = this->dense_diff_thld_;
     float threshold_Pw1_to_Pw2 = this->dense_diff_thld_;
     if(this->dense_diff_thld_<1e-5f) {
-        // threshold_Pw0_to_Pw1 = general_utils::nth_largest_in_mat<float>(depth_diff_Pw0_to_Pw1, int(pixels_num * 0.9f));
-        // threshold_Pw0_to_Pw2 = general_utils::nth_largest_in_mat<float>(depth_diff_Pw0_to_Pw2, int(pixels_num * 0.9f));
-        // threshold_Pw1_to_Pw2 = general_utils::nth_largest_in_mat<float>(depth_diff_Pw1_to_Pw2, int(pixels_num * 0.9f));
-        // std::cout<<"[debug] depth diff 90% thld "<<thr1<<" "<<thr2<<" "<<thr3<<std::endl;
-
         threshold_Pw0_to_Pw1 = (cv::mean(depth_diff_Pw0_to_Pw1))[0] * this->dense_diff_thld_ratio_;
         threshold_Pw0_to_Pw2 = (cv::mean(depth_diff_Pw0_to_Pw2))[0] * this->dense_diff_thld_ratio_;
         threshold_Pw1_to_Pw2 = (cv::mean(depth_diff_Pw1_to_Pw2))[0] * this->dense_diff_thld_ratio_;
         std::cout<<"[debug] depth diff mean thld "<<threshold_Pw0_to_Pw1<<" "<<threshold_Pw0_to_Pw2<<" "<<threshold_Pw1_to_Pw2<<std::endl;
     }
-
-    // auto iter_start_timing1 = std::chrono::steady_clock::now();
-
-    /*
-    Eigen::Map<Eigen::ArrayXf> depth_diff_Pw0_to_Pw1_eigen(reinterpret_cast<float*>(depth_diff_Pw0_to_Pw1.data), pixels_num);
-    Eigen::Map<Eigen::ArrayXf> depth_diff_Pw0_to_Pw2_eigen(reinterpret_cast<float*>(depth_diff_Pw0_to_Pw2.data), pixels_num);
-    Eigen::Map<Eigen::ArrayXf> depth_diff_Pw1_to_Pw2_eigen(reinterpret_cast<float*>(depth_diff_Pw1_to_Pw2.data), pixels_num);
-
-    Eigen::Map<Eigen::ArrayXf> depth0_valid_mask_eigen(reinterpret_cast<float*>(depth0_valid_mask.data), pixels_num);
-    Eigen::Map<Eigen::ArrayXf> depth1_valid_mask_eigen(reinterpret_cast<float*>(depth1_valid_mask.data), pixels_num);
-    Eigen::Map<Eigen::ArrayXf> depth2_valid_mask_eigen(reinterpret_cast<float*>(depth2_valid_mask.data), pixels_num);
-
-    // std::unordered_map<int, int> depth0_map, depth1_map, depth2_map;
-    for(int i=0; i<pixels_num; i++){
-        if(depth0_valid_mask_eigen[i]>1e-5f){
-            this->dense_init_fid_valid_pixels_[i] = scene_->getPointNumber();
-            auto& rgb0 = rgb0_cv.at<cv::Vec3f>(i);
-            Point3D point3D_0(Pw0(0, i), Pw0(1, i), Pw0(2, i), rgb0[0], rgb0[1], rgb0[2]);
-            scene_->cachePoint3D(scene_->getPointNumber(), point3D_0);
-            // depth0_map[i] = scene_->getPointNumber() - 1;
-            
-        }
-        if(depth1_valid_mask_eigen[i]>1e-5f &&
-            depth_diff_Pw0_to_Pw1_eigen[i]>threshold_Pw0_to_Pw1
-        ){
-            auto& rgb1 = rgb1_cv.at<cv::Vec3f>(i);
-            Point3D point3D_1(Pw1(0, i), Pw1(1, i), Pw1(2, i), rgb1[0], rgb1[1], rgb1[2]);
-            scene_->cachePoint3D(scene_->getPointNumber(), point3D_1);
-            // depth1_map[i] = scene_->getPointNumber() - 1;
-        }
-        if(depth2_valid_mask_eigen[i]>1e-5f &&
-            depth_diff_Pw0_to_Pw2_eigen[i]>threshold_Pw0_to_Pw2 &&
-            depth_diff_Pw1_to_Pw2_eigen[i]>threshold_Pw1_to_Pw2
-        ){
-            auto& rgb2 = rgb2_cv.at<cv::Vec3f>(i);
-            Point3D point3D_2(Pw2(0, i), Pw2(1, i), Pw2(2, i), rgb2[0], rgb2[1], rgb2[2]);
-            scene_->cachePoint3D(scene_->getPointNumber(), point3D_2);
-            // depth2_map[i] = scene_->getPointNumber() - 1;
-        }
-    }
-    // this->dense_init_fid_valid_pixels_.push_back(depth0_map);
-    // this->dense_init_fid_valid_pixels_.push_back(depth1_map);
-    // this->dense_init_fid_valid_pixels_.push_back(depth2_map);
-    */
 
     // auto iter_start_timing2 = std::chrono::steady_clock::now();
 
@@ -1264,6 +1414,45 @@ void GaussianMapper::cacheKeyframeDepthMap(){
     //     cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "init_depth" / "var_depth2_vis.jpg", var_depth2_vis);
     //    }
     }
+}
+
+void GaussianMapper::testCacheAllKeyframeDepthMap(){
+    std::cout<<"[Gaussian Mapper::testCacheAllKeyframeDepthMap] Testing cached keyframe depth maps..."<<std::endl;
+
+    int test_num = 300;
+    while (1)
+    {
+        std::vector<std::size_t> tracking_ids, mapping_ids;
+        this->pCuVSLAM_->GetFrameIds(tracking_ids);
+        this->scene_->getKeyframeIds(mapping_ids);
+
+        if(mapping_ids.size()>test_num) break;
+        
+        std::cout<<"[debug] size of tracking_ids "<<tracking_ids.size()<<" size of mapping_ids "<<mapping_ids.size()<<std::endl;
+        // diff tracking_ids and mapping_ids
+        if(tracking_ids.size()>mapping_ids.size()){
+            std::vector<std::size_t> diff_ids;
+            std::set_difference(tracking_ids.begin(), tracking_ids.end(), mapping_ids.begin(), mapping_ids.end(), std::back_inserter(diff_ids));
+            std::cout<<"[debug] size of diff_ids "<<diff_ids.size()<<std::endl;
+            for(std::size_t id : diff_ids){
+                std::cout<<"[debug] insert keyframe id "<<id<<" to cache"<<std::endl;
+                this->handleKeyframeFrontend(id);
+                auto& pkf = this->scene_->keyframes_.at(id);
+                auto gt_image = pkf->getGTLRImg(true);
+                auto gt_depth = pkf->getGTLRDpt(true);
+                auto valid_depth_mask = pkf->getGTLRDptMsk(true);
+                auto valid_depth = gt_depth * valid_depth_mask;
+                auto rand_mask = torch::rand_like(valid_depth);
+                auto mask = (rand_mask > 0.92f).to(torch::kFloat32).cuda();
+                valid_depth = valid_depth * mask;
+                this->gaussians_->increaseKeyframeInitPcd(pkf, valid_depth, gt_image, this->kf_params_);
+            }
+        }
+        // sleep for 100 ms
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    this->savePly(this->result_dir_ / ("run_cuvslam" + this->kf_params_.debug_dir_) / "ply_lr_test", false);
+    throw std::runtime_error("testCacheAllKeyframeDepthMap finished!");
 }
 
 void GaussianMapper::generatePyramidSizes(std::shared_ptr<GaussianKeyframe> pkf, const Camera& camera){
@@ -1669,6 +1858,158 @@ void GaussianMapper::run()
     signalStop();
 }
 
+void GaussianMapper::run_cuvslam(){
+    const int init_mapping_frames = 10; // !!! debug
+
+    //=== CuVSLAM integrated mapping ===//
+
+    // First loop: Initial gaussian mapping
+    std::cout<<"[GaussianMapper::run_cuvslam] Initial mapping loop start, waiting for CuVSLAM to accumulate enough frames..."<<std::endl;
+    if (this->wait_frontend_finish_)
+        std::cout<<"[GaussianMapper::run_cuvslam] Wait for CuVSLAM frontend tracking to finish before starting initial mapping."<<std::endl;
+    
+    while (!this->isStopped()){
+        if (this->wait_frontend_finish_ && !this->pCuVSLAM_->IsTrackingFinished()){
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            std::cout<<"[GaussianMapper::run_cuvslam] CuVSLAM frontend tracking, current frame count: "<<this->pCuVSLAM_->GetFrameCount()<<std::endl;
+        }
+        else if (this->pCuVSLAM_->GetFrameCount() < init_mapping_frames)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        else {
+            this->initial_mapped_ = true;
+            break;
+        }
+    }
+
+    if(this->wait_frontend_finish_) {
+        CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / "cuvslam_tracking"))
+        this->pCuVSLAM_->SaveTrajectory(result_dir_ / "cuvslam_tracking");
+    }
+
+    std::cout<<"[GaussianMapper::run_cuvslam] Initial mapping loop end, start processing CuVSLAM frames..."<<std::endl;
+    {
+        std::unique_lock<std::mutex> lock_render(this->mutex_render_);
+
+        std::vector<std::size_t> kfids;
+        this->pCuVSLAM_->GetFrameIds(kfids);
+
+        if (kfids.size() > init_mapping_frames && this->wait_frontend_finish_){
+            kfids.resize(init_mapping_frames);
+            std::cout<<"[GaussianMapper::run_cuvslam] CuVSLAM frame count "<<this->pCuVSLAM_->GetFrameCount()<<" exceeds initial mapping frames "<<init_mapping_frames<<", only process the first "<<init_mapping_frames<<" frames for initial mapping."<<std::endl;
+        }
+
+        for(int i=0; i<kfids.size(); i++){
+            auto frame_id = kfids.at(i);
+            this->handleKeyframeFrontend(frame_id);
+        }
+
+        // obtain initial dense pcd 
+        this->cacheKeyframeDepthMap(kfids);
+    }
+    
+    {
+        std::unique_lock<std::mutex> lock_render(this->mutex_render_);
+        this->scene_->cameras_extent_ = std::get<1>(this->scene_->getNerfppNorm());
+        // test dense xyz rgb idx to create gs
+        // project all 1's depth map by identity pose to get xyz
+        // cv::Mat depth_ones = cv::Mat::ones(this->kf_params_.lr_height_, this->kf_params_.lr_width_, CV_32FC1);
+        // int pixels_num = kf_params_.lr_width_ * kf_params_.lr_height_;
+        // Eigen::Map<Eigen::ArrayXf> depth_ones_eigen(reinterpret_cast<float*>(depth_ones.data), pixels_num);
+        // Eigen::MatrixXf Pw;
+        // Sophus::SE3f eye = Sophus::SE3f();
+        // std::cout<<"[debug] fxfycxcy "<<kf_params_.lr_fx_<<" "<<kf_params_.lr_fy_<<" "<<kf_params_.lr_cx_<<" "<<kf_params_.lr_cy_<<std::endl;
+        // general_utils::projectEigen_depth2pcd(
+        //     Pw, kf_params_.lr_cx_, kf_params_.lr_cy_, kf_params_.lr_fx_, kf_params_.lr_fy_,
+        //     this->dense_width_map_, this->dense_height_map_, depth_ones_eigen,
+        //     eye
+        // );
+        // auto test_xyz = torch::from_blob(Pw.data(), {pixels_num, 3}, torch::kFloat32).clone();
+        // auto test_rgb = torch::ones({pixels_num, 3}, torch::kFloat32);
+        // // change center pixel color to red
+        // int center_idx = (kf_params_.lr_height_ / 2) * kf_params_.lr_width_ + (kf_params_.lr_width_ / 2);
+        // test_rgb[center_idx][1] = 0.f;
+        // test_rgb[center_idx][2] = 0.f;
+        // auto test_idx = torch::zeros({pixels_num}, torch::kInt64);
+        // this->gaussians_->createFromPcd(test_xyz, test_rgb, test_idx, 1.f);
+
+        this->gaussians_->createFromPcd(this->dense_init_pcd_xyz_, this->dense_init_pcd_rgb_, this->dense_init_pcd_idx_, this->scene_->cameras_extent_);
+        std::unique_lock<std::mutex> lock(this->mutex_settings_);
+        this->gaussians_->trainingSetup(opt_params_);
+
+        if(this->kf_params_.debug_)
+            this->savePly(this->result_dir_ / ("run_cuvslam" + this->kf_params_.debug_dir_) / "ply_lr_init", false);
+    }
+    // {
+    //     std::unique_lock<std::mutex> lock_render(this->mutex_render_);
+    //     torch::NoGradGuard no_grad;
+    //     auto& pkf_first = this->scene_->keyframes().at(0);
+    //     std::cout<<"[debug] test pose:\n"<<pkf_first->getBasePose()<<std::endl;
+    //     auto render_pkg = GaussianRenderer::render(
+    //         pkf_first,
+    //         this->kf_params_.lr_height_,
+    //         this->kf_params_.lr_width_,
+    //         this->gaussians_,
+    //         this->pipe_params_,
+    //         this->background_,
+    //         this->override_color_,
+    //         false, true, true, true
+    //     );
+    //     auto rendered_image = std::get<0>(render_pkg);
+
+    //     auto rendered_image_cv = tensor_utils::torchTensor2CvMat_Float32(rendered_image);
+    //     cv::cvtColor(rendered_image_cv, rendered_image_cv, CV_RGB2BGR);
+    //     rendered_image_cv.convertTo(rendered_image_cv, CV_8UC3, 255.0f);
+    //     CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / ("run_cuvslam" + this->kf_params_.debug_dir_) / "lr_test"))
+    //     cv::imwrite(result_dir_ / ("run_cuvslam" + this->kf_params_.debug_dir_) / "lr_test" / (std::to_string(pkf_first->fid_) + "_render.jpg"), rendered_image_cv);
+
+    //     auto ones_tensor = torch::ones_like(rendered_image);
+    //     auto diff_image = torch::abs(rendered_image - ones_tensor);
+    //     std::cout<<"[debug] diff mean "<<diff_image.mean().item<float>()<<std::endl;
+    //     auto diff_image_cv = tensor_utils::torchTensor2CvMat_Float32(diff_image);
+    //     cv::cvtColor(diff_image_cv, diff_image_cv, CV_RGB2BGR);
+    //     diff_image_cv.convertTo(diff_image_cv, CV_8UC3, 255.0f);
+    //     cv::imwrite(result_dir_ / ("run_cuvslam" + this->kf_params_.debug_dir_) / "lr_test" / (std::to_string(pkf_first->fid_) + "_diff.jpg"), diff_image_cv);  
+
+    //     throw std::runtime_error("[GaussianMapper::run_cuvslam] debug throw after initial render!");
+    // }
+
+    // test cache all keyframe depth map
+    // this->testCacheAllKeyframeDepthMap();
+
+    // compute initial global alignment pose and timestamp
+    this->optimizeGlobalAlign();
+
+    if(this->kf_params_.debug_)
+        this->savePly(this->result_dir_ / ("run_cuvslam" + this->kf_params_.debug_dir_) / "ply_lr_aligned", false);
+    
+    // Second loop: Incremental gaussian mapping
+    while(!this->isStopped()){
+        std::vector<std::size_t> tracking_ids, mapping_ids;
+        this->pCuVSLAM_->GetFrameIds(tracking_ids);
+        this->scene_->getKeyframeIds(mapping_ids);
+
+        if(tracking_ids.size() > mapping_ids.size() + this->local_align_batch_size_){
+            std::vector<std::size_t> diff_ids;
+            std::set_difference(tracking_ids.begin(), tracking_ids.end(), mapping_ids.begin(), mapping_ids.end(), std::back_inserter(diff_ids));
+            
+            if(diff_ids.size() < this->local_align_batch_size_){
+                std::cerr << "[GaussianMapper::run_cuvslam] Warning: Expected new frames but the number of new frames (" << diff_ids.size() << ") is less than batch size (" << this->local_align_batch_size_ << ")." << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
+            std::cout<<"[GaussianMapper::run_cuvslam] Inserting new batch of keyframes, id range ["<<diff_ids.front()<<", "<<diff_ids.back()<<"], size "<<diff_ids.size()<<std::endl;
+            std::vector<std::size_t> batch_ids(diff_ids.begin(), diff_ids.begin() + this->local_align_batch_size_);
+            this->insertBatchKeyframes(batch_ids);
+        }
+        else{
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+    }
+
+}
+
 float GaussianMapper::optimizeGlobalLRPose(std::shared_ptr<GaussianKeyframe> pkf, bool use_differential_pose)
 {
     torch::Tensor loss;
@@ -1739,6 +2080,7 @@ float GaussianMapper::optimizeGlobalLRPose(std::shared_ptr<GaussianKeyframe> pkf
         while(confidence <= 0.f && render_attempts < this->max_pnp_render_attempts_){
             torch::Tensor rendered_image, rendered_depth, gt_depth, gt_image, gt_depth_mask, valid_mask;
             {
+                std::unique_lock<std::mutex> lock_render(mutex_render_);
                 torch::NoGradGuard no_grad;
 
                 auto render_pkg = GaussianRenderer::render(pkf,
@@ -1753,6 +2095,7 @@ float GaussianMapper::optimizeGlobalLRPose(std::shared_ptr<GaussianKeyframe> pkf
                 auto rendered_opacity = std::get<5>(render_pkg);
 
                 auto opacity_mask = (rendered_opacity > 0.5f).to(torch::kFloat32).squeeze();
+                std::cout<<"[debug] rendered opacity mask sum "<<opacity_mask.sum().item<float>()<<std::endl;
 
                 gt_image = pkf->getGTLRImg(true);
                 gt_depth = pkf->getGTLRDpt(true);
@@ -1828,29 +2171,36 @@ float GaussianMapper::optimizeGlobalLRPose(std::shared_ptr<GaussianKeyframe> pkf
             auto delta_pose_torch = torch::from_blob(delta_pose.ptr<float>(), {4, 4}, torch::kFloat32).to(device_type_);
             delta_pose_torch = delta_pose_torch.inverse();
 
-            auto updated_base_pose = delta_pose_torch.mm(pkf->getBasePose());
-            pkf->setBasePose(updated_base_pose);
+            {
+                std::unique_lock<std::mutex> lock_render(mutex_render_);
+                auto updated_base_pose = delta_pose_torch.mm(pkf->getBasePose());
+                std::cout<<"[debug 02201235] delta_pose_torch "<<delta_pose_torch<<" id "<<pkf->fid_<<std::endl;
+                pkf->setBasePose(updated_base_pose);
+            }
 
             if(kf_params_.debug_){
-                torch::NoGradGuard no_grad;
+                auto rendered_image_before = rendered_image.clone();
+                {
+                    std::unique_lock<std::mutex> lock_render(mutex_render_);
+                    torch::NoGradGuard no_grad;
+                    auto render_pkg = GaussianRenderer::render(
+                        pkf,
+                        this->kf_params_.lr_height_,
+                        this->kf_params_.lr_width_,
+                        this->gaussians_,
+                        this->pipe_params_,
+                        this->background_,
+                        this->override_color_,
+                        false, true, true, true
+                    );
 
-                auto render_pkg = GaussianRenderer::render(
-                    pkf,
-                    this->kf_params_.lr_height_,
-                    this->kf_params_.lr_width_,
-                    this->gaussians_,
-                    this->pipe_params_,
-                    this->background_,
-                    this->override_color_,
-                    false, true, true, true
-                );
+                    rendered_image = std::get<0>(render_pkg);
+                    rendered_depth = std::get<4>(render_pkg);
+                    auto rendered_opacity = std::get<5>(render_pkg);
 
-                rendered_image = std::get<0>(render_pkg);
-                rendered_depth = std::get<4>(render_pkg);
-                auto rendered_opacity = std::get<5>(render_pkg);
-
-                auto opacity_mask = (rendered_opacity > 0.5f).to(torch::kFloat32).squeeze();
-                valid_mask = opacity_mask * gt_depth_mask.squeeze();
+                    auto opacity_mask = (rendered_opacity > 0.5f).to(torch::kFloat32).squeeze();
+                    valid_mask = opacity_mask * gt_depth_mask.squeeze();
+                }
 
                 rendered_image = valid_mask.unsqueeze(0) * rendered_image;
 
@@ -1870,6 +2220,11 @@ float GaussianMapper::optimizeGlobalLRPose(std::shared_ptr<GaussianKeyframe> pkf
                 cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "lr_train_pose" / (std::to_string(pkf->fid_)+"_gt.jpg"), gt_cv);
                 std::cout<<"[debug] lr pose optim fid "<<pkf->fid_<<" final loss "<<loss.item<float>()<<std::endl;
                 metrics_utils::report_metrics(masked_rendered_image, masked_gt_image, this->lpips_model_);
+                auto diff_image = torch::abs(rendered_image_before - rendered_image);
+                auto diff_image_cv = tensor_utils::torchTensor2CvMat_Float32(diff_image);
+                cv::cvtColor(diff_image_cv, diff_image_cv, CV_RGB2BGR);
+                diff_image_cv.convertTo(diff_image_cv, CV_8UC3, 255.0f);
+                cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "lr_train_pose" / (std::to_string(pkf->fid_)+"_diff.jpg"), diff_image_cv); 
             }
         }
 
@@ -2204,50 +2559,55 @@ float GaussianMapper::optimizeGlobalHRPose(std::shared_ptr<GaussianKeyframe> pkf
 }
 
 float GaussianMapper::optimizeGlobalLRImg(std::shared_ptr<GaussianKeyframe> pkf, int i){
-    // 1st 1/3: sh=1, 2nd 1/3: sh=2, last 1/3: sh=3 
-    gaussians_->setShDegree(int(
-        float(i) / float(this->global_align_lr_iter_) * float(gaussians_->max_sh_degree_) + 1
-    ));
-
-    auto render_pkg = GaussianRenderer::render(
-        pkf,
-        this->kf_params_.lr_height_,
-        this->kf_params_.lr_width_,
-        this->gaussians_,
-        this->pipe_params_,
-        this->background_,
-        this->override_color_,
-        false
-    );
-
-    auto rendered_image = std::get<0>(render_pkg);
-    // auto viewspace_point_tensor = std::get<1>(render_pkg);
-    // auto visibility_filter = std::get<2>(render_pkg);
-    auto rendered_depth = std::get<4>(render_pkg);
-
-    auto gt_image = pkf->getGTLRImg(true);
-    auto gt_depth = pkf->getGTLRDpt(true);
-    auto gt_depth_mask = pkf->getGTLRDptMsk(true); 
-
-    auto loss = loss_utils::get_loss_rgbd(
-        rendered_image, gt_image,
-        rendered_depth, gt_depth,
-        this->lambdaDssim(),
-        this->global_align_lr_depth_lambda_,
-        pkf->exposure_a_, pkf->exposure_b_,
-        gt_depth_mask,
-        device_type_
-    );
-
-    loss.backward();
+    torch::Tensor gt_image, gt_depth, gt_depth_mask, rendered_image, rendered_depth, loss;
 
     {
-        torch::NoGradGuard no_grad;
+        std::unique_lock<std::mutex> lock_render(mutex_render_);
+        // 1st 1/3: sh=1, 2nd 1/3: sh=2, last 1/3: sh=3 
+        gaussians_->setShDegree(int(
+            float(i) / float(this->global_align_lr_iter_) * float(gaussians_->max_sh_degree_) + 1
+        ));
 
-        gaussians_->optimizer_->step();
-        gaussians_->optimizer_->zero_grad(true); 
+        auto render_pkg = GaussianRenderer::render(
+            pkf,
+            this->kf_params_.lr_height_,
+            this->kf_params_.lr_width_,
+            this->gaussians_,
+            this->pipe_params_,
+            this->background_,
+            this->override_color_,
+            false
+        );
 
-        pkf->zeroOptimizerGrad(true, true);
+        rendered_image = std::get<0>(render_pkg);
+        // auto viewspace_point_tensor = std::get<1>(render_pkg);
+        // auto visibility_filter = std::get<2>(render_pkg);
+        rendered_depth = std::get<4>(render_pkg);
+
+        gt_image = pkf->getGTLRImg(true);
+        gt_depth = pkf->getGTLRDpt(true);
+        gt_depth_mask = pkf->getGTLRDptMsk(true); 
+
+        loss = loss_utils::get_loss_rgbd(
+            rendered_image, gt_image,
+            rendered_depth, gt_depth,
+            this->lambdaDssim(),
+            this->global_align_lr_depth_lambda_,
+            pkf->exposure_a_, pkf->exposure_b_,
+            gt_depth_mask,
+            device_type_
+        );
+
+        loss.backward();
+
+        {
+            torch::NoGradGuard no_grad;
+
+            gaussians_->optimizer_->step();
+            gaussians_->optimizer_->zero_grad(true); 
+
+            pkf->zeroOptimizerGrad(true, true);
+        }
     }
 
     if(kf_params_.debug_ && (i==this->global_align_lr_iter_-1 || i==0)){
@@ -2273,274 +2633,47 @@ float GaussianMapper::optimizeGlobalLRImg(std::shared_ptr<GaussianKeyframe> pkf,
 }
 
 void GaussianMapper::optimizeGlobalAlign(){
-    std::unique_lock<std::mutex> lock_render(mutex_render_);
+    // std::unique_lock<std::mutex> lock_render(mutex_render_);
 
     auto iter_start_timing1 = std::chrono::steady_clock::now();
+    std::vector<std::size_t> keyframes_ids;
+    this->scene_->getKeyframeIds(keyframes_ids);
+    this->local_mapping_batch_ids_[0] = keyframes_ids;
 
     std::cout<<"[GaussianMapper::optimizeGlobalAlign] step0"<<std::endl;
-    // 0. optim 3 init keyframes pose
-    /*
-    for(int i=0; i<this->global_align_lr_pose_iter_; i++)
-    for(int id = 0; id<this->dense_init_fids_.size(); id++){
-        auto& pkf = scene_->keyframes().at(this->dense_init_fids_.at(id));
-
-        auto render_pkg = GaussianRenderer::render(
-            pkf,
-            this->kf_params_.lr_height_,
-            this->kf_params_.lr_width_,
-            this->gaussians_,
-            this->pipe_params_,
-            this->background_,
-            this->override_color_,
-            false, true, true, true
-        );
-
-        auto rendered_image = std::get<0>(render_pkg);
-        auto rendered_depth = std::get<4>(render_pkg);
-
-        auto gt_image = pkf->getGTLRImg(true);
-        auto gt_depth = pkf->getGTLRDpt(true);
-        auto gt_depth_mask = pkf->getGTLRDptMsk(true); 
-
-        auto loss = loss_utils::get_loss_rgbd(
-            rendered_image, gt_image,
-            rendered_depth, gt_depth,
-            this->lambdaDssim(),
-            this->global_align_lr_depth_lambda_,
-            pkf->exposure_a_, pkf->exposure_b_,
-            gt_depth_mask,
-            device_type_
-        );
-
-        loss.backward();
-
-        {
-            torch::NoGradGuard no_grad;
-
-            // fix gassuain primitves
-            // gaussians_->optimizer_->step();
-            gaussians_->optimizer_->zero_grad(true); 
-            // obtain se3 lie algebra
-            // pkf->optimizer_->step(true);
-            // pkf->optimizer_->zero_grad(true);
-            pkf->stepOptimizer(true);
-            pkf->zeroOptimizerGrad(true, true);
-            
-            // std::cout<<"[debug] fid "<<pkf->fid_<<" iter "<<i<<std::endl;
-            // pkf->updateBasePose();
-
-            try{
-                // std::cout<<"[debug] fid "<<pkf->fid_<<" iter "<<i<<" loss "<<loss.item<float>()<<std::endl;
-                pkf->updateBasePose();
-                // std::cout<<"[debug] updateBasePose "<<std::endl;
-            }
-            catch(std::exception& e){
-                std::cout<<"[error] theta "<<pkf->theta_<<" rho "<<pkf->rho_<<std::endl;
-                std::cout<<"[error] fid "<<pkf->fid_<<" iter "<<i<<std::endl;
-                std::cout<<e.what()<<std::endl;
-            }
-
-            if(i % 10 == 0) 
-                pkf->updateOptimizer(0.5f);
-            
-            if(kf_params_.debug_ && (i==this->global_align_lr_pose_iter_-1 || i==0)){
-            // if(kf_params_.debug_ && i==this->global_align_lr_pose_iter_-1){
-                auto masked_gt_image = gt_image * gt_depth_mask;
-                auto masked_gt_depth = gt_depth * gt_depth_mask;
-                auto masked_rendered_image = rendered_image * gt_depth_mask;
-                auto masked_rendered_depth = rendered_depth * gt_depth_mask;
-
-                auto image_cv = tensor_utils::torchTensor2CvMat_Float32(rendered_image);
-                cv::cvtColor(image_cv, image_cv, CV_RGB2BGR);
-                image_cv.convertTo(image_cv, CV_8UC3, 255.0f);
-                CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "lr_train_pose"))
-                cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "lr_train_pose" / (std::to_string(id)+"-"+std::to_string(i)+".jpg"), image_cv);
-                metrics_utils::report_metrics(masked_rendered_image, masked_gt_image, this->lpips_model_);
-            }
-        }
-    }
-    */
-    for(int id = 0; id<this->dense_init_fids_.size(); id++){
-        auto& pkf = scene_->keyframes().at(this->dense_init_fids_.at(id));
-        this->optimizeGlobalLRPose(pkf, false);
+    // 0. optim 3 init keyframes pose 
+    for(int id = 0; id<keyframes_ids.size(); id++){
+    // for(int id = 0; id<this->dense_init_fids_.size(); id++){
+        auto& pkf = scene_->keyframes().at(keyframes_ids.at(id));
+        // auto& pkf = scene_->keyframes().at(this->dense_init_fids_.at(id));
+        this->optimizeGlobalLRPose(pkf, false); // [test20260213] disable LR pnp
     }
 
-    for(int id = 0; id<this->dense_init_fids_.size(); id++)
-        scene_->keyframes().at(this->dense_init_fids_.at(id))->resetOptimizer();
-    gaussians_->resetOptimizer(opt_params_); // !!! notes try to add scale 1.2 for sequence `wall`
-
-    // std::vector<torch::Tensor> dense_init_poses_tensor = {
-    //     scene_->keyframes().at(this->dense_init_fids_.at(0))->getBasePose().cpu(),
-    //     scene_->keyframes().at(this->dense_init_fids_.at(1))->getBasePose().cpu(),
-    //     scene_->keyframes().at(this->dense_init_fids_.at(2))->getBasePose().cpu()
-    // };
-
-    // std::vector<Sophus::SE3f> dense_init_optimized_poses = {
-    //     tensor_utils::TensorTransformation2SE3f(dense_init_poses_tensor.at(0)),
-    //     tensor_utils::TensorTransformation2SE3f(dense_init_poses_tensor.at(1)),
-    //     tensor_utils::TensorTransformation2SE3f(dense_init_poses_tensor.at(2))
-    // };
-
-    // std::vector<cv::Mat> dense_init_diff_depths = {
-    //     this->getDepthDiff(
-    //         scene_->keyframes().at(this->dense_init_fids_.at(0)), 
-    //         scene_->keyframes().at(this->dense_init_fids_.at(1)), 
-    //         true, dense_init_optimized_poses.at(0), dense_init_optimized_poses.at(1)
-    //     ),
-    //     this->getDepthDiff(
-    //         scene_->keyframes().at(this->dense_init_fids_.at(0)), 
-    //         scene_->keyframes().at(this->dense_init_fids_.at(2)), 
-    //         true, dense_init_optimized_poses.at(0), dense_init_optimized_poses.at(2)
-    //     )
-    // };
-
-    // std::vector<cv::Mat> dense_init_depths_minmask = {
-    //     (dense_init_diff_depths.at(0) < this->global_align_lr_fix_mean3d_thld_),
-    //     (dense_init_diff_depths.at(1) < this->global_align_lr_fix_mean3d_thld_)
-    // };
-    // dense_init_depths_minmask.at(0).convertTo(dense_init_depths_minmask.at(0), CV_32FC1, 1.f/255.f);
-    // dense_init_depths_minmask.at(1).convertTo(dense_init_depths_minmask.at(1), CV_32FC1, 1.f/255.f);
-
-    // cv::Mat stable_mean3d_mask = dense_init_depths_minmask.at(0).mul(dense_init_depths_minmask.at(1));
-    // stable_mean3d_mask = stable_mean3d_mask.mul(scene_->keyframes().at(this->dense_init_fids_.at(0))->depth_undist_valid_mask_);
-    // Eigen::Map<Eigen::ArrayXf> stable_mean3d_mask_eigen(
-    //     (float*)stable_mean3d_mask.data,
-    //     kf_params_.lr_height_ * kf_params_.lr_width_
-    // );
-
-    // std::vector<int> stable_mean3d_indices;
-    // for(int i=0; i<stable_mean3d_mask_eigen.size(); i++)
-    //     if(stable_mean3d_mask_eigen[i] > 0.f)
-    //         stable_mean3d_indices.push_back(dense_init_fid_valid_pixels_[i]);
-
-    // torch::Tensor unstable_mean3d_indices_tensor = torch::ones({scene_->getPointNumber(), 1}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
-    // if(stable_mean3d_indices.size() > 0){
-    //     auto indices = torch::from_blob(
-    //         stable_mean3d_indices.data(),
-    //         {stable_mean3d_indices.size(), 1},
-    //         torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU)
-    //     );
-    //     unstable_mean3d_indices_tensor.index_put_({indices, 0}, 0.f);
-    // }
-    // std::cout<<"[debug] unstable_mean3d_indices_tensor sum "<<unstable_mean3d_indices_tensor.sum().item<float>()<<" sizes "<<unstable_mean3d_indices_tensor.sizes()<<std::endl;
-
-    // if(kf_params_.debug_){
-    //     for(int i=0; i<3; i++)
-    //         std::cout<<"[debug] optimized pose tensor "<<i<<"\n"<<dense_init_poses_tensor.at(i)<<std::endl;
-    //     for(int i=0; i<3; i++)
-    //         std::cout<<"[debug] optimized pose "<<i<<"\n"<<dense_init_optimized_poses.at(i).matrix()<<std::endl;
-    //     CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "init_depth"))
-    //     cv::Mat diff01_vis = dense_init_diff_depths.at(0) * this->rendered_depthmap_factor_;
-    //     diff01_vis.convertTo(diff01_vis, CV_8UC1, 255.0f/6000.0f, 0.f);
-    //     cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "init_depth" / "after_opt_depth_diff01_vis.jpg", diff01_vis);
-    //     cv::Mat diff02_vis = dense_init_diff_depths.at(1) * this->rendered_depthmap_factor_;
-    //     diff02_vis.convertTo(diff02_vis, CV_8UC1, 255.0f/6000.0f, 0.f);
-    //     cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "init_depth" / "after_opt_depth_diff02_vis.jpg", diff02_vis);
-    //     cv::Mat diff01_minmask = (dense_init_diff_depths.at(0)<0.1f);
-    //     diff01_minmask.convertTo(diff01_minmask, CV_32FC1, 1.f/255.f);
-    //     cv::Mat diff02_minmask = (dense_init_diff_depths.at(1)<0.1f);
-    //     diff02_minmask.convertTo(diff02_minmask, CV_32FC1, 1.f/255.f);
-    //     cv::Mat mask_and = diff01_minmask.mul(diff02_minmask);
-    //     mask_and = mask_and.mul(scene_->keyframes().at(this->dense_init_fids_.at(0))->depth_undist_valid_mask_);
-    //     mask_and.convertTo(mask_and, CV_8UC1, 255.f);
-    //     cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "init_depth" / "after_opt_depth_diff_minmask_and.jpg", mask_and);
-    //     cv::Mat mask_or = ((diff01_minmask + diff02_minmask)>0.f);
-    //     mask_or.convertTo(mask_or, CV_32FC1, 1.f/255.f);
-    //     mask_or = mask_or.mul(scene_->keyframes().at(this->dense_init_fids_.at(0))->depth_undist_valid_mask_);
-    //     mask_or.convertTo(mask_or, CV_8UC1, 255.f);
-    //     cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "init_depth" / "after_opt_depth_diff_minmask_or.jpg", mask_or);
-    // }
+    {
+        std::unique_lock<std::mutex> lock_render(mutex_render_);    
+        for(int id = 0; id<keyframes_ids.size(); id++)
+        // for(int id = 0; id<this->dense_init_fids_.size(); id++)
+            scene_->keyframes().at(keyframes_ids.at(id))->resetOptimizer();
+            // scene_->keyframes().at(this->dense_init_fids_.at(id))->resetOptimizer();
+        gaussians_->resetOptimizer(opt_params_); // !!! notes try to add scale 1.2 for sequence `wall`
+    }
 
     std::cout<<"[GaussianMapper::optimizeGlobalAlign] step1"<<std::endl;
     // 1. converge 3 init keyframes
     for(int i=0; i<this->global_align_lr_iter_; i++)
     for(int id = 0; id<this->dense_init_fids_.size(); id++){
         auto& pkf = scene_->keyframes().at(this->dense_init_fids_.at(id));
-        
-        /*
-        // 1st 1/3: sh=1, 2nd 1/3: sh=2, last 1/3: sh=3 
-        gaussians_->setShDegree(int(
-            float(i) / float(this->global_align_lr_iter_) * float(gaussians_->max_sh_degree_) + 1
-        ));
-
-        auto render_pkg = GaussianRenderer::render(
-        pkf,
-        this->kf_params_.lr_height_,
-        this->kf_params_.lr_width_,
-        this->gaussians_,
-        this->pipe_params_,
-        this->background_,
-        this->override_color_,
-        false, false
-        );
-
-        auto rendered_image = std::get<0>(render_pkg);
-        auto viewspace_point_tensor = std::get<1>(render_pkg);
-        auto visibility_filter = std::get<2>(render_pkg);
-        auto rendered_depth = std::get<4>(render_pkg);
-
-        auto gt_image = pkf->getGTLRImg(true);
-        auto gt_depth = pkf->getGTLRDpt(true);
-        auto gt_depth_mask = pkf->getGTLRDptMsk(true); 
-
-        auto loss = loss_utils::get_loss_rgbd(
-            rendered_image, gt_image,
-            rendered_depth, gt_depth,
-            this->lambdaDssim(),
-            this->global_align_lr_depth_lambda_,
-            pkf->exposure_a_, pkf->exposure_b_,
-            gt_depth_mask,
-            device_type_
-        );
-
-        loss.backward();
-
-        {
-            torch::NoGradGuard no_grad;
-
-            // fix gassuain primitves
-            gaussians_->optimizer_->step();
-            gaussians_->optimizer_->zero_grad(true); 
-            // obtain se3 lie algebra
-            // pkf->optimizer_->step();
-            // pkf->optimizer_->zero_grad(true);
-            pkf->zeroOptimizerGrad(true, true);
-
-            if(kf_params_.debug_){
-                // auto masked_gt_image = gt_image * gt_depth_mask;
-                // auto masked_gt_depth = gt_depth * gt_depth_mask;
-                // auto masked_rendered_image = rendered_image * gt_depth_mask;
-                // auto masked_rendered_depth = rendered_depth * gt_depth_mask;
-
-                auto image_cv = tensor_utils::torchTensor2CvMat_Float32(rendered_image);
-                cv::cvtColor(image_cv, image_cv, CV_RGB2BGR);
-                image_cv.convertTo(image_cv, CV_8UC3, 255.0f);
-                CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "lr_train"))
-                cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "lr_train" / (std::to_string(id)+"-"+std::to_string(i)+".jpg"), image_cv);
-            }
-
-            c10::cuda::CUDACachingAllocator::emptyCache();
-        }
-        */
-    
         this->optimizeGlobalLRImg(pkf, i);
     }
 
-    for(int id = 0; id<this->dense_init_fids_.size(); id++)
-        scene_->keyframes().at(this->dense_init_fids_.at(id))->resetOptimizer();
-    gaussians_->resetOptimizer(opt_params_);
+    // return; // [test20260213] disable HR
 
-    // if(kf_params_.debug_){
-    //     for(int id = 0; id<this->dense_init_fids_.size(); id++){
-    //         auto& pkf = scene_->keyframes().at(this->dense_init_fids_.at(id));
-    //         auto gt_image = pkf->getGTLRImg();
-    //         auto image_cv = tensor_utils::torchTensor2CvMat_Float32(gt_image);
-    //         cv::cvtColor(image_cv, image_cv, CV_RGB2BGR);
-    //         image_cv.convertTo(image_cv, CV_8UC3, 255.0f);
-    //         CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "lr_train_gt"))
-    //         cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "lr_train_gt" / (std::to_string(id)+".jpg"), image_cv);
-    //     }
-    // }
+    {
+        std::unique_lock<std::mutex> lock_render(mutex_render_);
+        for(int id = 0; id<this->dense_init_fids_.size(); id++)
+            scene_->keyframes().at(this->dense_init_fids_.at(id))->resetOptimizer();
+        gaussians_->resetOptimizer(opt_params_);
+    }
 
     auto iter_start_timing2 = std::chrono::steady_clock::now();
 
@@ -2559,17 +2692,38 @@ void GaussianMapper::optimizeGlobalAlign(){
         hr_resize_ratio = this->global_align_hr_resize_ratio_;
     }
 
-    std::vector<float> kf0_loss, kf1_loss, kf2_loss;
-    std::vector<torch::Tensor> hr_gts;
-    auto& pkf0 = scene_->keyframes().at(this->dense_init_fids_[0]);
-    auto& pkf1 = scene_->keyframes().at(this->dense_init_fids_[1]);
-    auto& pkf2 = scene_->keyframes().at(this->dense_init_fids_[2]);
+    std::size_t test_frames = 7; // debug number, should move to config
+    int global_time_align_frame_num = std::min(keyframes_ids.size(), test_frames);
+    std::vector<std::size_t> global_time_align_fids;
+
+    for (size_t i = 0; i < global_time_align_frame_num; i++) {
+        float pos = (float(i) / (global_time_align_frame_num - 1)) * (keyframes_ids.size() - 1);
+        int idx = int(std::round(pos));
+
+        if (idx >= static_cast<int>(keyframes_ids.size())) {
+            idx = static_cast<int>(keyframes_ids.size()) - 1;
+        } else if (idx < 0) {
+            idx = 0;
+        }
+
+        global_time_align_fids.push_back(keyframes_ids[idx]);
+    }
+
+    global_time_align_fids.erase(
+        std::unique(global_time_align_fids.begin(), global_time_align_fids.end()), 
+        global_time_align_fids.end()
+    );
+    std::cout<<"[debug] selected keyframes for global time alignment: ";
+    for(auto fid: global_time_align_fids) std::cout<<fid<<" ";
+    std::cout<<std::endl;
 
     // t_window = (t_lr0 + id_lrN / lr_fps) * hr_fps * ratio_window
-    float hr_window_size = (pkf0->lr_timestamp_ + float(this->dense_init_fids_[this->dense_init_fids_.size()-1])/kf_params_.lr_fps_ ) * kf_params_.hr_fps_ * this->global_align_time_window_ratio_;
+    auto& pkf0 = scene_->keyframes().at(keyframes_ids[0]);
+    float hr_window_size = (pkf0->lr_timestamp_ + float(global_time_align_fids[global_time_align_fids.size()-1])/kf_params_.lr_fps_ ) * kf_params_.hr_fps_ * this->global_align_time_window_ratio_;
     // size_t hr_start_fid = int(pkf0->lr_timestamp_ * kf_params_.hr_fps_);
     std::cout<<"[debug] hr_window_size "<<hr_window_size<<std::endl;
 
+    std::vector<torch::Tensor> hr_gts;
     for(int i=0; i<hr_window_size; i++){
         auto hr_undist_mat = general_utils::readRGB2cvMat(this->vstrHRImagePaths_[i], 
             true, kf_params_.hr_undistort_map1_, kf_params_.hr_undistort_map2_);
@@ -2584,9 +2738,112 @@ void GaussianMapper::optimizeGlobalAlign(){
         hr_gts.push_back(hr_undist_tensor);
     }
 
+    if(kf_params_.debug_){
+        std::cout<<"[debug] global time align fids: ";
+        for(auto fid: global_time_align_fids) std::cout<<fid<<" ";
+        std::cout<<std::endl;
+    }
+
+    std::vector<std::vector<float>> all_kf_losses(global_time_align_frame_num);
+    std::vector<torch::Tensor> kf_rendered_imgs(global_time_align_frame_num);
+    std::vector<size_t> kf_hr_fids(global_time_align_frame_num);
+
+    {
+        std::unique_lock<std::mutex> lock_render(mutex_render_);
+        torch::NoGradGuard no_grad;
+        for (size_t k = 0; k < global_time_align_frame_num; k++) {
+            auto& pkf = scene_->keyframes().at(global_time_align_fids[k]);
+            auto render_pkg = GaussianRenderer::render(
+                pkf,
+                hr_height_resize, hr_width_resize,
+                this->gaussians_, this->pipe_params_,
+                this->background_, this->override_color_,
+                true, true
+            );
+            kf_rendered_imgs[k] = std::get<0>(render_pkg);
+        }
+    }
+
+    std::vector<bool> valid_match(global_time_align_frame_num, false);
+    {
+        torch::NoGradGuard no_grad;
+        std::size_t search_start = 0;
+
+        for (std::size_t k = 0; k < global_time_align_frame_num; k++) {
+            std::cout<<"[debug] search start id: "<<search_start<<" for keyframe "<<k<<" (fid "<<global_time_align_fids[k]<<")\n";
+            auto& rendered_img = kf_rendered_imgs[k];
+            auto& cur_loss = all_kf_losses[k];
+
+            if (search_start >= hr_gts.size()) {
+                std::cout << "[warn] Keyframe " << k << " skipped: HR frames exhausted.\n";
+                break;  // stop further matching
+            }
+
+            for (std::size_t i = search_start; i < hr_gts.size(); i++) {
+                auto gt_image = hr_gts[i].cuda();
+                float loss_val = loss_utils::l1_loss(rendered_img, gt_image).item<float>();
+                cur_loss.push_back(loss_val);
+            }
+
+            // find best match
+            std::size_t local_min_idx = std::distance(
+                cur_loss.begin(),
+                std::min_element(cur_loss.begin(), cur_loss.end()));
+            std::size_t matched_hr_idx = search_start + local_min_idx;
+
+            if (matched_hr_idx >= hr_gts.size() - 1) {
+                std::cout << "[warn] Keyframe " << k << " match index out of HR range ("
+                        << matched_hr_idx << " / " << hr_gts.size()
+                        << "), skipping.\n";
+                break;  // skip remaining frames as HR window exhausted
+            }
+
+            kf_hr_fids[k] = matched_hr_idx;
+            valid_match[k] = true;
+
+            search_start = matched_hr_idx + 1; // progress window forward
+        }
+
+        for (auto& t : hr_gts) t = torch::Tensor();
+    }
+
+    std::vector<float> delta_times;
+    delta_times.reserve(global_time_align_frame_num);
+
+    for (size_t k = 0; k < global_time_align_frame_num; k++) {
+        if (!valid_match[k]) continue; // skip unusable ones
+
+        auto& pkf = scene_->keyframes().at(global_time_align_fids[k]);
+        float dt = float(kf_hr_fids[k]) / this->kf_params_.hr_fps_ - pkf->lr_timestamp_;
+        delta_times.push_back(dt);
+
+        if (kf_params_.debug_) {
+            std::cout << "[debug] kf" << k << " delta_t: " << dt << std::endl;
+        }
+    }
+
+    if (delta_times.empty()) {
+        throw std::runtime_error("[GaussianMapper::optimizeGlobalAlign] No valid HR matches found for global alignment!");
+        // std::cout << "[warn] No valid HR matches found — global alignment disabled.\n";
+        // this->global_align_time_ = 0.0f;
+    } else {
+        this->global_align_time_ =
+            std::accumulate(delta_times.begin(), delta_times.end(), 0.f) / delta_times.size();
+
+        std::cout << "[debug] global_align_time " << this->global_align_time_
+                  << " (computed from " << delta_times.size() << " valid matches)\n";
+    }
+
+    /*
+    std::vector<float> kf0_loss, kf1_loss, kf2_loss;
+    auto& pkf0 = scene_->keyframes().at(this->dense_init_fids_[0]);
+    auto& pkf1 = scene_->keyframes().at(this->dense_init_fids_[1]);
+    auto& pkf2 = scene_->keyframes().at(this->dense_init_fids_[2]);
+
     torch::Tensor kf0_rendered, kf1_rendered, kf2_rendered;
     size_t kf0_hr_fid, kf1_hr_fid, kf2_hr_fid;
     {
+        std::unique_lock<std::mutex> lock_render(mutex_render_);
         torch::NoGradGuard no_grad;
         auto render_pkg0 = GaussianRenderer::render(pkf0,
             hr_height_resize, hr_width_resize,
@@ -2610,7 +2867,9 @@ void GaussianMapper::optimizeGlobalAlign(){
         kf0_rendered = std::get<0>(render_pkg0);
         kf1_rendered = std::get<0>(render_pkg1);
         kf2_rendered = std::get<0>(render_pkg2);
-
+    }
+    {
+        torch::NoGradGuard no_grad;
         for(int i=0; i<hr_gts.size(); i++){
             auto gt_image = hr_gts[i].cuda();
             auto loss = loss_utils::l1_loss(kf0_rendered, gt_image);
@@ -2658,10 +2917,16 @@ void GaussianMapper::optimizeGlobalAlign(){
 
     this->global_align_time_ = (f0_delta_time + f1_delta_time + f2_delta_time) / 3.f;
     std::cout<<"[debug] estimated global align time offset "<<this->global_align_time_<<std::endl;
-    
-    for(int id = 0; id<scene_->keyframes_ids_.size(); id++){
-        auto& pkf = scene_->keyframes().at(scene_->keyframes_ids_.at(id));
-        if(!pkf->setGTHRImg(this->global_align_time_, this->vstrHRImagePaths_)) continue;
+    */
+
+    for(int id = 0; id<keyframes_ids.size(); id++){
+        auto& pkf = this->scene_->keyframes().at(keyframes_ids.at(id));
+        bool has_hr_fid = false;
+        {
+            std::unique_lock<std::mutex> lock_render(mutex_render_);
+            has_hr_fid = pkf->setGTHRImg(this->global_align_time_, this->vstrHRImagePaths_);
+        }
+        if(!has_hr_fid) continue;
 
         if(kf_params_.debug_){
             std::cout<<"[debug] final match [lr_id] "<<pkf->fid_<<" [lr_time] "<<pkf->lr_timestamp_<<" [est hr_id] "<<pkf->hr_fid_<<" [est hr time] "<<(pkf->lr_timestamp_ + this->global_align_time_)<<" [gt hr time] "<<this->vHRTimestamps_[pkf->hr_fid_]<<std::endl;
@@ -2703,8 +2968,8 @@ void GaussianMapper::optimizeGlobalAlign(){
         kf_params_.lr_height_
     );
     float hr_ratio = float(size_hr.height) / float(kf_params_.hr_height_);
-    for(int id=0; id<scene_->keyframes_ids_.size(); id++){
-        auto& pkf = scene_->keyframes().at(scene_->keyframes_ids_.at(id));
+    for(int id=0; id<keyframes_ids.size(); id++){
+        auto& pkf = scene_->keyframes().at(keyframes_ids.at(id));
         if(!pkf->has_hr_fid_) continue;
 
         int good_matches = pkf->matchInitHROrbGMS();
@@ -2760,297 +3025,39 @@ void GaussianMapper::optimizeGlobalAlign(){
         // std::cout<<"[debug] id "<<i<<" confidence "<<rt_confidences[i]<<" "<<(rt_confidences[i] / sum_confidence)<<" rvec \n"<<rvecs[i]<<" tvec \n"<<tvecs[i]<<std::endl;
     }
 
-    cv::Mat T_avg = general_utils::vecs2transformation(rvec_avg, tvec_avg);
-    this->global_align_pose_ = torch::from_blob(T_avg.ptr<float>(), {4, 4}, torch::kFloat32).to(device_type_);
-    std::cout<<"[debug] averaged T_lr2hr (this->global_align_pose_) \n"<<this->global_align_pose_<<std::endl;
+    {
+        std::unique_lock<std::mutex> lock_render(mutex_render_);
 
-    /*
-    std::cout<<"[GaussianMapper::optimizeGlobalAlign] step3"<<std::endl;
-    // 3. estimate global pose offset
-    std::vector<bool> dense_init_fids_has_hr = {
-        scene_->keyframes().at(this->dense_init_fids_.at(0))->has_hr_fid_,
-        scene_->keyframes().at(this->dense_init_fids_.at(1))->has_hr_fid_,
-        scene_->keyframes().at(this->dense_init_fids_.at(2))->has_hr_fid_
-    };
+        cv::Mat T_avg = general_utils::vecs2transformation(rvec_avg, tvec_avg);
+        this->global_align_pose_ = torch::from_blob(T_avg.ptr<float>(), {4, 4}, torch::kFloat32).to(device_type_);
+        std::cout<<"[debug] averaged T_lr2hr (this->global_align_pose_) \n"<<this->global_align_pose_<<std::endl;
 
-    if(dense_init_fids_has_hr[0])
-        this->global_algin_fids_ = this->dense_init_fids_;
-    else if(dense_init_fids_has_hr[1] && dense_init_fids_has_hr[2]){
-        std::size_t next_valid_id;
-        for(int i=0; i<scene_->keyframes_ids_.size(); i++)
-            if(scene_->keyframes().at(scene_->keyframes_ids_.at(i))->has_hr_fid_){
-                next_valid_id = scene_->keyframes_ids_.at(i);
-                break;
-            }
-        this->global_algin_fids_ = {next_valid_id, this->dense_init_fids_.at(1), this->dense_init_fids_.at(2)};
-    }
-    else if(dense_init_fids_has_hr[2]){
-        std::size_t next_valid_id, next_valid_i;
-        for(int i=0; i<scene_->keyframes_ids_.size(); i++)
-            if(scene_->keyframes().at(scene_->keyframes_ids_.at(i))->has_hr_fid_){
-                next_valid_id = scene_->keyframes_ids_.at(i);
-                break;
-            }
-        int temp_id = int(scene_->keyframes_ids_.size()/3.f*2.f) + this->dense_fid_offset_;
-        this->global_algin_fids_ = {next_valid_id, this->dense_init_fids_.at(2), scene_->keyframes_ids_.at(2*temp_id-next_valid_i)};
-    }
-    else throw std::runtime_error("[GaussianMapper::optimizeGlobalAlign] no valid hr fid found in dense init fids!");
-
-    std::vector<float> loss_iter0, loss_iterwarm;
-    for(int i = 0; i < (this->global_align_hr_iter_ + this->global_align_hr_warmup_iter_); i++){
-        torch::Tensor total_loss = torch::zeros({1}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
-        for(int id=0; id<this->global_algin_fids_.size(); id++){
-            auto& pkf = scene_->keyframes().at(this->global_algin_fids_.at(id));
-            auto render_pkg = GaussianRenderer::render(pkf,
-                hr_height_resize, hr_width_resize,
-                this->gaussians_, this->pipe_params_,
-                this->background_, this->override_color_,
-                true, true, true, true
-            );
-
-            auto rendered_image = std::get<0>(render_pkg);
-            auto rendered_depth = std::get<4>(render_pkg);
-            auto rendered_opacity = std::get<5>(render_pkg);
-            auto opacity_mask = (rendered_opacity > this->global_align_opcacity_thr_).to(torch::kFloat32);
-
-            torch::Tensor linear_sampling_map;
-            auto gt_image = pkf->getGTHRImg(linear_sampling_map, hr_resize_ratio, true);
-
-            auto loss_rgb = loss_utils::get_loss_rgb(
-                linear_sampling_map,
-                rendered_image, gt_image,
-                0.1f,
-                pkf->exposure_a_, pkf->exposure_b_,
-                opacity_mask,
-                device_type_
-            );
-
-            auto loss_depth = loss_utils::get_loss_hr2lr(
-                linear_sampling_map, rendered_depth.squeeze(), opacity_mask.squeeze(),
-                pkf->getGTLRDpt(true), pkf->getGTLRDptMsk(true),
-                kf_params_.hr_fx_*hr_resize_ratio, kf_params_.hr_fy_*hr_resize_ratio, 
-                kf_params_.hr_cx_*hr_resize_ratio, kf_params_.hr_cy_*hr_resize_ratio,
-                kf_params_.lr_fx_, kf_params_.lr_fy_, 
-                kf_params_.lr_cx_, kf_params_.lr_cy_,
-                pkf->getGlobalDeltaPose()
-            );
-
-            // auto loss = loss_rgb + this->global_align_hr_pose_depth_lambda_*loss_depth;
-            auto loss = (1.f-this->global_align_hr_pose_depth_lambda_)*loss_rgb + this->global_align_hr_pose_depth_lambda_*loss_depth;
-
-            std::cout<<"[debug] iter "<<i<<" fid "<<pkf->fid_<<" rgb loss "<<loss.item<float>()<<" depth loss "<<loss_depth.item<float>()<<std::endl;
-
-            // loss.backward();
-            total_loss += loss;
-            // std::cout<<"[debug] iter "<<i<<" fid "<<pkf->fid_<<" loss "<<loss.item<float>()<<std::endl;
-
-            if(i == 0) 
-                loss_iter0.push_back(loss.item<float>());
-            if(i == (this->global_align_hr_warmup_iter_ - 1))
-                loss_iterwarm.push_back(loss.item<float>());
-
-            // std::cout<<"[debug] iter "<<i<<" id "<<id<<" a "<<pkf->exposure_a_<<" b "<<pkf->exposure_b_<<std::endl;
-
-            if(kf_params_.debug_ && (i+1)%5==0){
-            {
-            torch::NoGradGuard no_grad;
-                auto masked_rendered_image = rendered_image * opacity_mask;
-                auto masked_gt_image = gt_image * opacity_mask;
-                auto masked_rendered_image_ab = masked_rendered_image * torch::exp(pkf->exposure_a_) + pkf->exposure_b_;
-                {
-                auto image_cv = tensor_utils::torchTensor2CvMat_Float32(rendered_image);
-                cv::cvtColor(image_cv, image_cv, CV_RGB2BGR);
-                image_cv.convertTo(image_cv, CV_8UC3, 255.0f);
-                CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "hr_train_pose"))
-                cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "hr_train_pose" / (std::to_string(id)+"-"+std::to_string(i)+".jpg"), image_cv);
-                }
-                {
-                auto image_cv = tensor_utils::torchTensor2CvMat_Float32(masked_rendered_image);
-                cv::cvtColor(image_cv, image_cv, CV_RGB2BGR);
-                image_cv.convertTo(image_cv, CV_8UC3, 255.0f);
-                CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "hr_train_pose_masked"))
-                cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "hr_train_pose_masked" / (std::to_string(id)+"-"+std::to_string(i)+".jpg"), image_cv);
-                }
-                {
-                auto image_cv = tensor_utils::torchTensor2CvMat_Float32(masked_rendered_image_ab);
-                cv::cvtColor(image_cv, image_cv, CV_RGB2BGR);
-                image_cv.convertTo(image_cv, CV_8UC3, 255.0f);
-                CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "hr_train_pose_masked_ab"))
-                cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "hr_train_pose_masked_ab" / (std::to_string(id)+"-"+std::to_string(i)+".jpg"), image_cv);
-                }
-                {
-                auto opacity_mask_gs = (rendered_opacity > 0.01f).to(torch::kFloat32);
-                opacity_mask_gs = opacity_mask_gs.squeeze().cpu();
-                auto image_cv = tensor_utils::torchTensor2CvMat_Float32(opacity_mask_gs);
-                image_cv.convertTo(image_cv, CV_8UC1, 255.0f);
-                CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "hr_gs_mask"))
-                cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "hr_gs_mask" / (std::to_string(id)+"-"+std::to_string(i)+".jpg"), image_cv);
-                }
-                {
-                rendered_depth = rendered_depth.squeeze().cpu();
-                opacity_mask = opacity_mask.squeeze().cpu();
-                linear_sampling_map = linear_sampling_map.cpu();
-                torch::Tensor y_coords = torch::div(linear_sampling_map, rendered_depth.size(1), "floor");
-                torch::Tensor x_coords = torch::remainder(linear_sampling_map, rendered_depth.size(1));
-                auto valid_mask = opacity_mask.index({y_coords, x_coords}) > 0.f;
-                y_coords = y_coords.index({valid_mask});
-                x_coords = x_coords.index({valid_mask});
-                auto hr_xy_vis = torch::zeros({rendered_depth.size(0), rendered_depth.size(1)}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
-                hr_xy_vis.index_put_({y_coords, x_coords}, 1.f);
-                auto image_cv = tensor_utils::torchTensor2CvMat_Float32(hr_xy_vis);
-                image_cv.convertTo(image_cv, CV_8UC1, 255.0f);
-                CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "hr_pose_deth"))
-                cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "hr_pose_deth" / (std::to_string(id)+"-"+std::to_string(i)+"-hr.jpg"), image_cv);
-                
-                auto z_hr = rendered_depth.index({y_coords, x_coords});
-                auto x_hr = (x_coords - kf_params_.hr_cx_*hr_resize_ratio) * z_hr / (kf_params_.hr_fx_*hr_resize_ratio);
-                auto y_hr = (y_coords - kf_params_.hr_cy_*hr_resize_ratio) * z_hr / (kf_params_.hr_fy_*hr_resize_ratio);
-                auto Pc_hr = torch::stack({x_hr, y_hr, z_hr}, 1); // [N, 3]
-                auto pose = pkf->getGlobalDeltaPose().cpu();
-                auto Pc_lr = pose.inverse().mm(
-                    torch::cat({Pc_hr, torch::ones({Pc_hr.size(0), 1}, Pc_hr.options())}, 1).transpose(0, 1)
-                ).transpose(0, 1).index({torch::indexing::Slice(), torch::indexing::Slice(0, 3)}); // [N,3]
-                auto X_lr = Pc_lr.index({torch::indexing::Slice(), 0});
-                auto Y_lr = Pc_lr.index({torch::indexing::Slice(), 1});
-                auto Z_lr = Pc_lr.index({torch::indexing::Slice(), 2});
-                auto u_lr = (X_lr * kf_params_.lr_fx_ / Z_lr + kf_params_.lr_cx_).to(torch::kInt64);
-                auto v_lr = (Y_lr * kf_params_.lr_fy_ / Z_lr + kf_params_.lr_cy_).to(torch::kInt64);
-                auto valid_lr_mask = (Z_lr > 0) * (u_lr >=0) * (u_lr < kf_params_.lr_width_) * (v_lr >=0) * (v_lr < kf_params_.lr_height_);
-                // std::cout <<"[debug] u2 "<< u_lr.min().item<float>() << " " << u_lr.max().item<float>() << std::endl;
-                // std::cout <<"[debug] v2 "<< v_lr.min().item<float>() << " " << v_lr.max().item<float>() << std::endl;
-                u_lr = u_lr.index({valid_lr_mask});
-                v_lr = v_lr.index({valid_lr_mask});
-                // std::cout <<"[debug] u2 aft "<< u_lr.min().item<float>() << " " << u_lr.max().item<float>() << std::endl;
-                // std::cout <<"[debug] v2 aft "<< v_lr.min().item<float>() << " " << v_lr.max().item<float>() << std::endl;
-                auto lr_xy_vis = torch::zeros({kf_params_.lr_height_, kf_params_.lr_width_}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
-                lr_xy_vis.index_put_({v_lr, u_lr}, 1.f);
-                auto image_cv2 = tensor_utils::torchTensor2CvMat_Float32(lr_xy_vis);
-                image_cv2.convertTo(image_cv2, CV_8UC1, 255.0f);
-                cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "hr_pose_deth" / (std::to_string(id)+"-"+std::to_string(i)+"-hr2lr.jpg"), image_cv2);
-                }
-            }
-            }
-        
+        // this->getAvgGlobalPose(this->global_algin_fids_, this->global_align_pose_);
+        for(int i=0; i<keyframes_ids.size(); i++){
+            auto& pkf = scene_->keyframes().at(keyframes_ids.at(i));
+            pkf->setGlobalDeltaPose(this->global_align_pose_);
         }
-        
-        auto pose_loss = loss_utils::get_loss_pairpose(
-            scene_->keyframes().at(this->global_algin_fids_.at(0))->getGlobalDeltaPose(),
-            scene_->keyframes().at(this->global_algin_fids_.at(1))->getGlobalDeltaPose(),
-            0.5f
-        ) + loss_utils::get_loss_pairpose(
-            scene_->keyframes().at(this->global_algin_fids_.at(0))->getGlobalDeltaPose(),
-            scene_->keyframes().at(this->global_algin_fids_.at(2))->getGlobalDeltaPose(),
-            0.5f
-        ) + loss_utils::get_loss_pairpose(
-            scene_->keyframes().at(this->global_algin_fids_.at(1))->getGlobalDeltaPose(),
-            scene_->keyframes().at(this->global_algin_fids_.at(2))->getGlobalDeltaPose(),
-            0.5f
-        );
-
-        auto pose_reg = loss_utils::get_loss_posereg(
-            scene_->keyframes().at(this->global_algin_fids_.at(0))->getGlobalDeltaPose()
-        ) + loss_utils::get_loss_posereg(
-            scene_->keyframes().at(this->global_algin_fids_.at(1))->getGlobalDeltaPose()
-        ) + loss_utils::get_loss_posereg(
-            scene_->keyframes().at(this->global_algin_fids_.at(2))->getGlobalDeltaPose()
-        );
-
-        std::cout<<"[debug] iter "<<i<<" pose loss "<<pose_loss.item<float>()<<" render loss "<<total_loss.item<float>()<<" pose reg "<<pose_reg.item<float>()<<std::endl;
-
-        total_loss += (pose_loss * this->global_align_hr_pose_lambda_ + pose_reg * this->global_align_hr_pose_reg_lambda_);
-        total_loss.backward();
-
-        {
-            torch::NoGradGuard no_grad;
-
-            // fix gassuain primitves
-            gaussians_->optimizer_->step();
-            gaussians_->optimizer_->zero_grad(true);
-            for(int id=0; id<this->global_algin_fids_.size(); id++){
-                auto& pkf = scene_->keyframes().at(this->global_algin_fids_.at(id));
-                // pkf->optimizer_->step(true, true); 
-                // pkf->optimizer_->zero_grad(true);
-                pkf->stepOptimizer(true, true);
-                pkf->zeroOptimizerGrad(true, true);
-                pkf->updateGlobalDeltaPose(true);
-            }
-
-            c10::cuda::CUDACachingAllocator::emptyCache();
-        }
-
-        if(this->global_align_hr_warmup_iter_ > 1 && i == (this->global_align_hr_warmup_iter_ - 1)){
-            torch::Tensor delta_pose;
-            std::vector<std::size_t> valid_global_algin_fids;
-            for(int j=0; j<this->global_algin_fids_.size(); j++)
-                if(loss_iterwarm[j] < loss_iter0[j] * 0.6f)
-                    valid_global_algin_fids.push_back(this->global_algin_fids_.at(j));
-
-            if(valid_global_algin_fids.empty())
-                throw std::runtime_error("[GaussianMapper::optimizeGlobalAlign] no valid keyframe for global pose warmup!");
-
-            if(valid_global_algin_fids.size() == 1)
-                delta_pose = scene_->keyframes().at(valid_global_algin_fids.at(0))->getGlobalDeltaPose().clone();
-            else
-                this->getAvgGlobalPose(valid_global_algin_fids, delta_pose); 
-            // this->getAvgGlobalPose(this->global_algin_fids_, delta_pose);
-            for(int j=0; j<this->global_algin_fids_.size(); j++){
-                auto& pkf_other = scene_->keyframes().at(this->global_algin_fids_.at(j));
-                pkf_other->setGlobalDeltaPose(delta_pose);
-                pkf_other->resetOptimizer(true, 
-                    kf_params_.theta_lr_ * this->global_align_hr_warmup_lr_dump_, 
-                    kf_params_.rho_lr_ * this->global_align_hr_warmup_lr_dump_);
-            }
-
-            std::cout<<"[debug] global align warmup avg pose\n"<<delta_pose<<std::endl;
-
-            // for(int id = 0; id<this->global_algin_fids_.size(); id++)
-            //     scene_->keyframes().at(this->global_algin_fids_.at(id))->resetOptimizer();
-            // gaussians_->resetOptimizer(opt_params_);
-        }
-    }
-
-    for(int id = 0; id<this->global_algin_fids_.size(); id++)
-        scene_->keyframes().at(this->global_algin_fids_.at(id))->resetOptimizer();
-    gaussians_->resetOptimizer(opt_params_);   
-
-    if(kf_params_.debug_){
-        for(int id = 0; id<this->global_algin_fids_.size(); id++){
-            auto& pkf = scene_->keyframes().at(this->global_algin_fids_.at(id));
-            auto gt_image = pkf->getGTHRImg();
-            auto image_cv = tensor_utils::torchTensor2CvMat_Float32(gt_image);
-            cv::cvtColor(image_cv, image_cv, CV_RGB2BGR);
-            image_cv.convertTo(image_cv, CV_8UC3, 255.0f);
-            CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "hr_train_pose_gt"))
-            cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "hr_train_pose_gt" / (std::to_string(id)+".jpg"), image_cv);
-        }
-    }
-
-    */
-
-    // this->getAvgGlobalPose(this->global_algin_fids_, this->global_align_pose_);
-    for(int i=0; i<scene_->keyframes_ids_.size(); i++){
-        auto& pkf = scene_->keyframes().at(scene_->keyframes_ids_.at(i));
-        pkf->setGlobalDeltaPose(this->global_align_pose_);
     }
 
     if(kf_params_.debug_){
     {
         torch::NoGradGuard no_grad;
-
-        for(int id = 0; id<scene_->keyframes_ids_.size(); id++){
-            auto& pkf = scene_->keyframes().at(scene_->keyframes_ids_.at(id));
+        torch::Tensor rendered_image, gt_image;
+        for(int id = 0; id<keyframes_ids.size(); id++){
+            auto& pkf = scene_->keyframes().at(keyframes_ids.at(id));
             if(!pkf->has_hr_fid_) continue;
+            {
+                std::unique_lock<std::mutex> lock_render(mutex_render_);
+                auto render_pkg = GaussianRenderer::render(pkf,
+                    this->kf_params_.hr_height_, this->kf_params_.hr_width_,
+                    this->gaussians_, this->pipe_params_,
+                    this->background_, this->override_color_,
+                    true, true, true, true
+                );
 
-            auto render_pkg = GaussianRenderer::render(pkf,
-                this->kf_params_.hr_height_, this->kf_params_.hr_width_,
-                this->gaussians_, this->pipe_params_,
-                this->background_, this->override_color_,
-                true, true, true, true
-            );
-
-            auto rendered_image = std::get<0>(render_pkg);
-            auto gt_image = pkf->getGTHRImg(1.f, true);
-
+                rendered_image = std::get<0>(render_pkg);
+                gt_image = pkf->getGTHRImg(1.f, true);
+            }
             auto image_cv = tensor_utils::torchTensor2CvMat_Float32(rendered_image);
             cv::cvtColor(image_cv, image_cv, CV_RGB2BGR);
             image_cv.convertTo(image_cv, CV_8UC3, 255.0f);
@@ -3070,272 +3077,66 @@ void GaussianMapper::optimizeGlobalAlign(){
 
     std::cout<<"[GaussianMapper::optimizeGlobalAlign] new step4: init hr local pose"<<std::endl;
 
-    for(int id=0; id<scene_->keyframes_ids_.size(); id++){
-        auto& pkf = scene_->keyframes().at(scene_->keyframes_ids_.at(id));
+    for(int id=0; id<keyframes_ids.size(); id++){
+        auto& pkf = scene_->keyframes().at(keyframes_ids.at(id));
         if(!pkf->has_hr_fid_) continue;
 
         this->optimizeGlobalHRPose(pkf, false);
         
-        // std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> render_pkg;
-
-        /*
-        {
-            torch::NoGradGuard no_grad;
-
-            // run once to check init loss
-            render_pkg = GaussianRenderer::render(pkf,
-                hr_height_resize, hr_width_resize,
-                this->gaussians_, this->pipe_params_,
-                this->background_, this->override_color_,
-                true, true, true, true
-            );
-
-            auto rendered_image = std::get<0>(render_pkg);
-            auto rendered_depth = std::get<4>(render_pkg);
-            auto rendered_opacity = std::get<5>(render_pkg);
-            auto opacity_mask = (rendered_opacity > 0.1f).to(torch::kFloat32);
-
-            auto gt_image = pkf->getGTHRImg(hr_resize_ratio, true);
-
-            auto loss_rgb = loss_utils::get_loss_rgb(rendered_image, gt_image,
-                this->lambdaDssim(), 
-                torch::Tensor(), torch::Tensor(), opacity_mask);
-
-            float init_loss = loss_rgb.item<float>();
-
-            if(kf_params_.debug_)
-            std::cout<<"[debug] fid "<<pkf->fid_<<" init rgb loss "<<loss_rgb.item<float>()<<std::endl;
-
-            // run once 3d-2d alignment
-            std::vector<cv::KeyPoint> keypoints_render, keypoints_gt;
-            std::vector<int> matches_render2gt, matches_gt2render;
-            int good_matches = pkf->matchHROrbGMS(
-                rendered_image, hr_resize_ratio,
-                keypoints_render, keypoints_gt,
-                matches_render2gt, matches_gt2render
-            );
-
-            if(good_matches < 50) 
-                throw std::runtime_error("[debug] fid "+std::to_string(pkf->fid_)+" not enough good matches "+std::to_string(good_matches));
-
-            cv::Mat rvec, tvec;
-            std::vector<int> inliers;
-            cv::Mat K_hr = (cv::Mat_<double>(3,3) << 
-                kf_params_.hr_fx_ * hr_resize_ratio, 0, kf_params_.hr_cx_ * hr_resize_ratio,
-                0, kf_params_.hr_fy_ * hr_resize_ratio, kf_params_.hr_cy_ * hr_resize_ratio,
-                0, 0, 1
-            );
-
-            auto depth_cpu = rendered_depth.squeeze().to(torch::kCPU).contiguous();
-            cv::Mat depth_cv(depth_cpu.size(0), depth_cpu.size(1), CV_32F);
-            std::memcpy(depth_cv.data, depth_cpu.data_ptr<float>(), sizeof(float)*depth_cpu.size(0)*depth_cpu.size(1));
-
-            float confidence = this->getRelatedPoseGMS(
-                pkf, 
-                keypoints_render, keypoints_gt,
-                matches_render2gt,
-                depth_cv,
-                K_hr,
-                rvec, tvec, inliers
-            );
-
-            if(confidence < 0.f) 
-                throw std::runtime_error("[debug] fid "+std::to_string(pkf->fid_)+" getRelatedPoseGMS failed ");
-
-            auto delta_pose = general_utils::vecs2transformation(rvec, tvec);
-            auto delta_pose_torch = torch::from_blob(delta_pose.ptr<float>(), {4, 4}, torch::kFloat32).to(device_type_);
-            pkf->setLocalDeltaPose(delta_pose_torch);
-
-            // check the 3d-2d refined loss
-            render_pkg = GaussianRenderer::render(pkf,
-                hr_height_resize, hr_width_resize,
-                this->gaussians_, this->pipe_params_,
-                this->background_, this->override_color_,
-                true, true, true, true
-            );
-
-            rendered_image = std::get<0>(render_pkg);
-            rendered_opacity = std::get<5>(render_pkg);
-            opacity_mask = (rendered_opacity > 0.1f).to(torch::kFloat32);
-
-            loss_rgb = loss_utils::get_loss_rgb(rendered_image, gt_image,
-                this->lambdaDssim(), 
-                torch::Tensor(), torch::Tensor(), opacity_mask);
-
-            if(kf_params_.debug_)
-            std::cout<<"[debug] fid "<<pkf->fid_<<" after init local delta pose rgb loss "<<loss_rgb.item<float>()<<std::endl;
-
-            if(loss_rgb.item<float>() > init_loss){
-                auto identity_pose = torch::eye(4, torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
-                pkf->setLocalDeltaPose(identity_pose);
-            }
-        }
-        */
-
-        /*
-        pkf->resetOptimizer(true, kf_params_.hr_color_theta_lr_, kf_params_.hr_color_rho_lr_);
-        pkf->resetFullExposure();
-        torch::Tensor opacity_mask;
-        for(int i=0; i<this->global_align_hr_pose_iter_; i++){
-            render_pkg = GaussianRenderer::render(pkf,
-                hr_height_resize, hr_width_resize,
-                this->gaussians_, this->pipe_params_,
-                this->background_, this->override_color_,
-                true, true, true, true
-            );
-
-            auto rendered_image = std::get<0>(render_pkg);
-            auto rendered_depth = std::get<4>(render_pkg);
-            auto rendered_opacity = std::get<5>(render_pkg);
-
-            if(i==0)
-                opacity_mask = (rendered_opacity > 0.5f).to(torch::kFloat32);
-            
-            // torch::Tensor linear_sampling_map;
-            // auto gt_image = pkf->getGTHRImg(linear_sampling_map, hr_resize_ratio, true);
-            auto gt_image = pkf->getGTHRImg(hr_resize_ratio, true);
-
-            // auto loss_rgb = loss_utils::get_loss_rgb(rendered_image, gt_image,
-            //     0.f, //this->lambdaDssim(), 
-            //     torch::Tensor(), torch::Tensor(), opacity_mask);
-            auto loss_rgb = loss_utils::get_loss_rgb(rendered_image, gt_image,
-                this->lambdaDssim(), pkf->exposure_a_, pkf->exposure_b_, opacity_mask);
-            // auto loss_rgb = loss_utils::get_loss_rgb(linear_sampling_map, rendered_image, gt_image,
-            //     this->lambdaDssim(), pkf->exposure_a_, pkf->exposure_b_, opacity_mask);
-
-            // auto loss_depth = loss_utils::get_loss_hr2lr(
-            //     linear_sampling_map, rendered_depth.squeeze(), opacity_mask.squeeze(),
-            //     pkf->getGTLRDpt(true), pkf->getGTLRDptMsk(true),
-            //     kf_params_.hr_fx_*hr_resize_ratio, kf_params_.hr_fy_*hr_resize_ratio, 
-            //     kf_params_.hr_cx_*hr_resize_ratio, kf_params_.hr_cy_*hr_resize_ratio,
-            //     kf_params_.lr_fx_, kf_params_.lr_fy_, 
-            //     kf_params_.lr_cx_, kf_params_.lr_cy_,
-            //     pkf->getFullDeltaPose()
-            // );
-
-            // auto loss = (1.f - this->global_align_hr_pose_depth_lambda_) * loss_depth + this->global_align_hr_pose_depth_lambda_ * loss_rgb;
-            auto loss = loss_rgb;
-            loss.backward();
-
-            {
-                torch::NoGradGuard no_grad;
-
-                gaussians_->optimizer_->step();
-                // gaussians_->optimizer_->zero_grad(true); 
-
-                pkf->stepOptimizer(true, true);
-                pkf->zeroOptimizerGrad(true, true);
-
-                pkf->updateLocalDeltaPose(true);
-
-                if(i==this->global_align_hr_pose_iter_/2)
-                    pkf->updateOptimizer(0.7f);
-
-                if(kf_params_.debug_){
-                    std::cout<<"[debug] fid "<<pkf->fid_<<" iter "<<i<<" rgb loss "<<loss_rgb.item<float>()<<std::endl;
-
-                    CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "hr_pose"))
-                    rendered_image = rendered_image * torch::exp(pkf->exposure_a_) + pkf->exposure_b_;
-                    // auto cv_opacity_mask = tensor_utils::torchTensor2CvMat_Float32(opacity_mask);
-                    // cv_opacity_mask.convertTo(cv_opacity_mask, CV_8UC1, 255.0f);
-                    // cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "hr_pose" / ("mask_" + std::to_string(pkf->fid_) + "_" + std::to_string(i) + ".jpg"), cv_opacity_mask);
-                    // auto masked_rendered_image = rendered_image * opacity_mask;
-                    // auto image_cv = tensor_utils::torchTensor2CvMat_Float32(masked_rendered_image);
-                    auto image_cv = tensor_utils::torchTensor2CvMat_Float32(rendered_image);
-                    cv::cvtColor(image_cv, image_cv, CV_RGB2BGR);
-                    image_cv.convertTo(image_cv, CV_8UC3, 255.0f);
-                    cv::imwrite(result_dir_ / (std::to_string(getIteration()) + kf_params_.debug_dir_) / "hr_pose" / ("hr_" + std::to_string(pkf->fid_) + "_" + std::to_string(i) + ".jpg"), image_cv);
-
-                    if(i==0){
-                        auto masked_gt_image = gt_image * opacity_mask;
-                        auto masked_rendered_image = rendered_image * opacity_mask;
-                        std::cout<<"[debug] fid "<<pkf->fid_<<" init metrics: ";
-                        metrics_utils::report_metrics(masked_rendered_image, masked_gt_image, this->lpips_model_);
-                    }
-                    if(i==this->global_align_hr_pose_iter_-1){
-                        auto masked_gt_image = gt_image * opacity_mask;
-                        auto masked_rendered_image = rendered_image * opacity_mask;
-                        std::cout<<"[debug] fid "<<pkf->fid_<<" final metrics: ";
-                        metrics_utils::report_metrics(masked_rendered_image, masked_gt_image, this->lpips_model_);
-                    }
-                }
-            }
-
-        }*/
     }
 
     // throw std::runtime_error("[debug] step5!");
 
     std::cout<<"[GaussianMapper::optimizeGlobalAlign] step5: hr color refinement"<<std::endl;
-    gaussians_->resetOptimizer(opt_params_, 1.8f);
     std::vector<std::size_t> random_hr_color_fids;
-    this->getBatchShuffledFrameIds(scene_->keyframes_ids_, random_hr_color_fids, this->global_align_hr_color_iter_);
-    // int random_count = 0;
-    // for(int i=0; random_count<this->global_align_hr_color_iter_; i++){
-    //     int id = scene_->keyframes_ids_.at(i % scene_->keyframes_ids_.size());
-    //     auto& pkf = scene_->keyframes().at(id);
-    //     if(!pkf->has_hr_fid_) continue;
-    //     random_hr_color_fids.push_back(id);
-    //     random_count++;
-    // }
-    // std::shuffle(random_hr_color_fids.begin(), random_hr_color_fids.end(), std::default_random_engine(0));
-
-
-    for(int i=0; i<scene_->keyframes_ids_.size(); i++){
-        auto& pkf = scene_->keyframes().at(scene_->keyframes_ids_.at(i));
-        // pkf->resetOptimizer();
-        // pkf->resetOptimizer(true, kf_params_.hr_color_theta_lr_, kf_params_.hr_color_rho_lr_); // change
-        pkf->updateOptimizer(0.7f);
-        pkf->resetFullExposure();
+    {
+        std::unique_lock<std::mutex> lock_render(mutex_render_);
+        gaussians_->resetOptimizer(opt_params_, 1.8f);
+        
+        this->getBatchShuffledFrameIds(keyframes_ids, random_hr_color_fids, this->global_align_hr_color_iter_);
+    
+        for(int i=0; i<keyframes_ids.size(); i++){
+            auto& pkf = scene_->keyframes().at(keyframes_ids.at(i));
+            // pkf->resetOptimizer();
+            // pkf->resetOptimizer(true, kf_params_.hr_color_theta_lr_, kf_params_.hr_color_rho_lr_); // change
+            pkf->updateOptimizer(0.7f);
+            pkf->resetFullExposure();
+        }
     }
 
     // std::cout<<"[debug] gs sh degree "<<this->gaussians_->active_sh_degree_<<std::endl;
     hr_resize_ratio = this->getRsizedHRScale(1.f, hr_width_resize, hr_height_resize);
-    std::vector<torch::Tensor> opacity_masks(scene_->keyframes_ids_.size(), torch::Tensor());
+    std::unordered_map<std::size_t, torch::Tensor> opacity_masks;
     for(int i=0; i<this->global_align_hr_color_iter_; i++){
         auto id = random_hr_color_fids.at(i); // !!! need change back to (i)
         auto& pkf = scene_->keyframes().at(id);
 
-        auto render_pkg = GaussianRenderer::render(pkf,
-            hr_height_resize, hr_width_resize,
-            this->gaussians_, this->pipe_params_,
-            this->background_, this->override_color_,
-            true, true, false, false
-        );
-        
-        auto rendered_image = std::get<0>(render_pkg);
-        auto rendered_depth = std::get<4>(render_pkg);
-        auto rendered_opacity = std::get<5>(render_pkg);
-        
-        if(!opacity_masks[id].defined())
-            opacity_masks[id] = (rendered_opacity > 0.1f).to(torch::kFloat32);
-        
-        auto opacity_mask = opacity_masks[id];
-        
-        // torch::Tensor linear_sampling_map;
-        // auto gt_image = pkf->getGTHRImg(linear_sampling_map, hr_resize_ratio, true);
-        auto gt_image = pkf->getGTHRImg(hr_resize_ratio, true);
+        torch::Tensor rendered_image, rendered_depth, rendered_opacity, gt_image, opacity_mask;
+        {
+            std::unique_lock<std::mutex> lock_render(mutex_render_);
+            auto render_pkg = GaussianRenderer::render(pkf,
+                hr_height_resize, hr_width_resize,
+                this->gaussians_, this->pipe_params_,
+                this->background_, this->override_color_,
+                true, true, false, false
+            );
+            
+            rendered_image = std::get<0>(render_pkg);
+            rendered_depth = std::get<4>(render_pkg);
+            rendered_opacity = std::get<5>(render_pkg);
+            
+            if(!opacity_masks[id].defined())
+                opacity_masks[id] = (rendered_opacity > 0.1f).to(torch::kFloat32);
+            
+            opacity_mask = opacity_masks[id];
+            
+            gt_image = pkf->getGTHRImg(hr_resize_ratio, true);
+        }
 
-        // auto loss_rgb = loss_utils::get_loss_rgb(rendered_image, gt_image,
-        //     0.f, //this->lambdaDssim(), 
-        //     torch::Tensor(), torch::Tensor(), opacity_mask);
         auto loss_rgb = loss_utils::get_loss_rgb(rendered_image, gt_image,
             this->lambdaDssim(), pkf->exposure_a_, pkf->exposure_b_, opacity_mask);
 
-        // auto loss_depth = loss_utils::get_loss_hr2lr(
-        //     linear_sampling_map, rendered_depth.squeeze(), opacity_mask.squeeze(),
-        //     pkf->getGTLRDpt(true), pkf->getGTLRDptMsk(true),
-        //     kf_params_.hr_fx_*hr_resize_ratio, kf_params_.hr_fy_*hr_resize_ratio, 
-        //     kf_params_.hr_cx_*hr_resize_ratio, kf_params_.hr_cy_*hr_resize_ratio,
-        //     kf_params_.lr_fx_, kf_params_.lr_fy_, 
-        //     kf_params_.lr_cx_, kf_params_.lr_cy_,
-        //     pkf->getFullDeltaPose()
-        // );
-
-        // auto loss = (1.f - this->global_align_hr_color_lambda_) * loss_depth + this->global_align_hr_color_lambda_ * loss_rgb;
         auto loss = loss_rgb;
-        // std::cout<<"[debug] hr color iter "<<i<<" fid "<<pkf->fid_<<" loss "<<loss.item<float>()<<" rgb loss "<<loss_rgb.item<float>()<<std::endl;
-        // std::cout<<"[debug] hr color iter "<<i<<" fid "<<pkf->fid_<<" loss "<<loss.item<float>()<<" rgb loss "<<loss_rgb.item<float>()<<" depth loss "<<loss_depth.item<float>()<<std::endl;
 
         loss.backward();
 
@@ -3532,102 +3333,6 @@ float GaussianMapper::getRelatedPoseGMS(
     return float(inliers.size()) / float(pts3d.size());
 }
 
-/*
-torch::Tensor GaussianMapper::refinePoseFastVGICP(std::shared_ptr<GaussianKeyframe> pkf){
-    std::cout<<"[GaussianMapper::refinePoseFastVGICP] refine pose for keyframe "<<pkf->fid_<<std::endl;
-
-    // create pcl cloud from existing points
-    auto xyz_cpu = this->gaussians_->getXYZ().to(torch::kCPU).contiguous();
-    const float* xyz_ptr = xyz_cpu.data_ptr<float>();
-
-    auto pcl_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-    pcl_cloud->resize(xyz_cpu.size(0));
-    for(int i=0; i<xyz_cpu.size(0); i++){
-        pcl_cloud->at(i).x = xyz_ptr[i*3 + 0];
-        pcl_cloud->at(i).y = xyz_ptr[i*3 + 1];
-        pcl_cloud->at(i).z = xyz_ptr[i*3 + 2];
-    }
-    pcl_cloud->erase(
-        std::remove_if(
-            pcl_cloud->begin(), pcl_cloud->end(),
-            [](const pcl::PointXYZ& pt){ 
-                return pt.getVector3fMap().squaredNorm() < 1e-3f || !pcl::isFinite(pt) || std::isnan(pt.x) || std::isnan(pt.y) || std::isnan(pt.z); 
-            }
-        ),
-        pcl_cloud->end()
-    );
-    std::cout<<"[GaussianMapper::refinePoseFastVGICP] pcl cloud has "<<pcl_cloud->size()<<" points."<<std::endl;
-
-    // create pcl cloud from keyframe points
-    auto init_pose_torch = pkf->getBasePose();
-    auto init_pose_se3 = tensor_utils::TensorTransformation2SE3f(init_pose_torch);
-
-    torch::Tensor valid_depth = (pkf->getGTLRDpt(true) * pkf->getGTLRDptMsk(true)).contiguous().squeeze().flatten();
-    torch::Tensor depth_mask = (valid_depth > 1e-5f);
-    torch::Tensor x = (this->dense_width_map_tensor_ - this->kf_params_.lr_cx_) * valid_depth / this->kf_params_.lr_fx_;
-    torch::Tensor y = (this->dense_height_map_tensor_ - this->kf_params_.lr_cy_) * valid_depth / this->kf_params_.lr_fy_;
-    torch::Tensor pts_tensor = torch::stack(std::vector<torch::Tensor>{x, y, valid_depth}, 1);
-    pts_tensor = pts_tensor.index_select(0, depth_mask.nonzero().squeeze()).contiguous().to(torch::kCPU);
-
-    auto pcl_kf_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-
-    const float* pts_ptr = pts_tensor.data_ptr<float>();
-    pcl_kf_cloud->resize(pts_tensor.size(0));
-    for(int i=0; i<pts_tensor.size(0); i++){
-        pcl_kf_cloud->at(i).x = pts_ptr[i*3 + 0];
-        pcl_kf_cloud->at(i).y = pts_ptr[i*3 + 1];
-        pcl_kf_cloud->at(i).z = pts_ptr[i*3 + 2];
-    }
-    pcl::transformPointCloud(*pcl_kf_cloud, *pcl_kf_cloud, init_pose_se3.matrix().inverse());
-    pcl_kf_cloud->erase(
-        std::remove_if(
-            pcl_kf_cloud->begin(), pcl_kf_cloud->end(),
-            [](const pcl::PointXYZ& pt){ 
-                return pt.getVector3fMap().squaredNorm() < 1e-3f || !pcl::isFinite(pt) || std::isnan(pt.x) || std::isnan(pt.y) || std::isnan(pt.z); 
-            }
-        ),
-        pcl_kf_cloud->end()
-    );
-    std::cout<<"[GaussianMapper::refinePoseFastVGICP] pcl keyframe cloud has "<<pcl_kf_cloud->size()<<" points."<<std::endl;
-
-    // create vgicp
-    pcl::VoxelGrid<pcl::PointXYZ> vg_kf, vg_scene;
-    float leaf_size = 5e-3f;
-    vg_kf.setLeafSize(leaf_size, leaf_size, leaf_size);
-    vg_scene.setLeafSize(leaf_size, leaf_size, leaf_size);
-    // auto downsampled_kf_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-    pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled_kf_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-    vg_kf.setInputCloud(pcl_kf_cloud);
-    vg_kf.filter(*downsampled_kf_cloud);
-    // auto downsampled_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-    pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-    vg_scene.setInputCloud(pcl_cloud);
-    vg_scene.filter(*downsampled_cloud);
-    std::cout<<"[GaussianMapper::refinePoseFastVGICP] downsampled keyframe cloud has "<<downsampled_kf_cloud->size()<<" points."<<std::endl;
-    std::cout<<"[GaussianMapper::refinePoseFastVGICP] downsampled scene cloud has "<<downsampled_cloud->size()<<" points."<<std::endl;  
-
-    fast_gicp::FastVGICPCuda<pcl::PointXYZ, pcl::PointXYZ> vgicp;
-    vgicp.setResolution(1.f);
-
-    vgicp.setNearestNeighborSearchMethod(fast_gicp::NearestNeighborMethod::CPU_PARALLEL_KDTREE);
-    vgicp.clearSource();
-    vgicp.clearTarget();
-    vgicp.setInputSource(downsampled_kf_cloud);
-    vgicp.setInputTarget(downsampled_cloud);
-
-    auto aligned_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-    vgicp.align(*aligned_cloud);
-
-    auto refined_pose = vgicp.getFinalTransformation();
-    auto refined_pose_torch = tensor_utils::EigenMatrix2TorchTensor(refined_pose).inverse();
-
-    auto updated_pose_torch = refined_pose_torch.mm(init_pose_torch);
-    pkf->setBasePose(updated_pose_torch);
-
-    return refined_pose_torch;
-}
-*/
-
 void GaussianMapper::insertNewKeyframesFromSLAM(){
     std::map<ORB_SLAM3::MappingOperation::OprType, std::vector<std::size_t>> local_mapping_operation;
     ORB_SLAM3::MappingOperation::OprType opr_type;
@@ -3718,6 +3423,46 @@ void GaussianMapper::insertNewKeyframesFromSLAM(){
     // std::cout<<"[GaussianMapper::insertNewKeyframesFromSLAM] inserted "<<new_kf_ids.size()<<" new keyframes."<<std::endl;
     throw std::runtime_error("[GaussianMapper::insertNewKeyframesFromSLAM] debug throw!");
 
+}
+
+std::size_t GaussianMapper::handleKeyframeFrontend(std::size_t kfid){
+    // used for cuvslam
+    std::shared_ptr<GaussianKeyframe> new_kf = 
+        std::make_shared<GaussianKeyframe>(kfid, 0, &this->kf_params_);
+
+    std::vector<double> tum_pose; // tx, ty, tz, qx, qy, qz, qw
+    this->pCuVSLAM_->GetPose(kfid, tum_pose, new_kf->lr_timestamp_);
+    new_kf->setPose(tum_pose[6], tum_pose[3], tum_pose[4], tum_pose[5], // qw,qx,qy,qz
+                    tum_pose[0], tum_pose[1], tum_pose[2], true); // tx, ty, tz
+    new_kf->zfar_ = this->z_far_;
+    new_kf->znear_ = this->z_near_;
+
+    Camera& camera = this->scene_->cameras_.at(0);
+    new_kf->setCameraParams(camera);
+
+    cv::Mat img_rgb, img_depth;
+    std::string img_depth_filename;
+    this->pCuVSLAM_->GetFrame(kfid, img_rgb, img_depth, new_kf->img_filename_, img_depth_filename); // already undistorted from L515
+    new_kf->setGTLRImg(img_rgb, true);
+    new_kf->setGTLRDpt(img_depth, true);
+
+    this->increaseKeyframeTimesOfUse(new_kf, this->newKeyframeTimesOfUse());
+
+    if(this->kf_params_.debug_){
+        CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((this->result_dir_ / ("run_cuvslam" + this->kf_params_.debug_dir_) / "lr_undist"))
+        cv::Mat imgAux_vis = new_kf->img_auxiliary_undist_.clone();
+        cv::Mat imgRGB_vis = new_kf->img_undist_.clone();
+        imgRGB_vis.convertTo(imgRGB_vis, CV_8UC3, 255.0f, 0.f);
+        cv::cvtColor(imgRGB_vis, imgRGB_vis, cv::COLOR_BGR2RGB);
+        imgAux_vis.convertTo(imgAux_vis, CV_8UC1, this->kf_params_.lr_depth_factor_/6000.0f*255.0f, 0.f);
+        auto path_rgb = (this->result_dir_ / ("run_cuvslam" + this->kf_params_.debug_dir_) / "lr_undist" / (std::to_string(new_kf->fid_) + "_imgRGB.jpg"));
+        auto path_aux = (this->result_dir_ / ("run_cuvslam" + this->kf_params_.debug_dir_) / "lr_undist" / (std::to_string(new_kf->fid_) + "_imgAux.jpg"));
+        cv::imwrite(path_rgb.string(), imgRGB_vis);
+        cv::imwrite(path_aux.string(), imgAux_vis);
+    }
+
+    this->scene_->addKeyframe(new_kf, &this->kfid_shuffled_);
+    return new_kf->fid_;
 }
 
 std::size_t GaussianMapper::handleKeyframeFrontend(KeyframeFrontend& kf, std::shared_ptr<GaussianKeyframe> new_kf, float timestamp){
@@ -3852,7 +3597,7 @@ float GaussianMapper::optimizeLocalLRPose(
         float confidence = -1.f;
         int render_attempts = 0;
 
-        torch::Tensor rendered_image, gt_depth, gt_image, gt_depth_mask, valid_mask;
+        torch::Tensor rendered_image, gt_depth, gt_image, gt_depth_mask, valid_mask, base_pose_copy;
         while(confidence <= 0.f && render_attempts < this->max_pnp_render_attempts_){
             {
                 torch::NoGradGuard no_grad;
@@ -3905,7 +3650,7 @@ float GaussianMapper::optimizeLocalLRPose(
                 cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lr_train_pose" / (std::to_string(pkf->fid_)+"_gt.jpg"), gt_cv);
                 metrics_utils::report_metrics(masked_rendered_image, masked_gt_image, this->lpips_model_);
             }
-
+            // auto time1 = std::chrono::steady_clock::now();
             std::vector<cv::KeyPoint> kpts_rendered, kpts_gt;
             std::vector<int> matches_rendered2gt, matches_gt2rendered;
             int good_matches = pkf->matchLROrbGMS(rendered_image, 
@@ -3936,6 +3681,9 @@ float GaussianMapper::optimizeLocalLRPose(
                 rvec, tvec,
                 inliers
             );
+            // auto time2 = std::chrono::steady_clock::now();
+            // auto pnp_time = std::chrono::duration_cast<std::chrono::milliseconds>(time2 - time1).count();
+            // std::cout<<"[GaussianMapper::optimizeLocalLRPose] PnP pose estimation time for fid "<<pkf->fid_<<" took "<<pnp_time<<"ms"<<std::endl;
 
             if(confidence <= 0.f){
                 render_attempts++;
@@ -3947,7 +3695,9 @@ float GaussianMapper::optimizeLocalLRPose(
             auto delta_pose_torch = torch::from_blob(delta_pose.ptr<float>(), {4, 4}, torch::kFloat32).to(device_type_);
             delta_pose_torch = delta_pose_torch.inverse();
 
+            
             auto updated_base_pose = delta_pose_torch.mm(pkf->getBasePose());
+            base_pose_copy = pkf->getBasePose().clone();
             pkf->setBasePose(updated_base_pose);
 
             torch::Tensor updated_loss;
@@ -3979,7 +3729,20 @@ float GaussianMapper::optimizeLocalLRPose(
                     device_type_
                 );
 
-            }    
+            }   
+
+            if (updated_loss.item<float>() > loss.item<float>()){
+                std::cout<<"[GaussianMapper::optimizeLocalLRPose] rendered RGBD LR pose update increases loss from "<<loss.item<float>()<<" to "<<updated_loss.item<float>()<<", revert pose update."<<std::endl;
+                pkf->setBasePose(base_pose_copy);
+
+                if(kf_params_.debug_){
+                    std::cout<<"[GaussianMapper::optimizeLocalLRPose] classic pose fid "<<pkf->fid_<<" GMS confidence "<<confidence
+                        <<" inliers "<<inliers.size()<<"/"<<good_matches
+                        <<" loss before "<<loss.item<float>()
+                        <<" loss after "<<updated_loss.item<float>()<<std::endl;
+                }
+                break;
+            }
 
             if(kf_params_.debug_){
                 auto masked_rendered_image = rendered_image * valid_mask.unsqueeze(0);
@@ -3991,12 +3754,7 @@ float GaussianMapper::optimizeLocalLRPose(
                 metrics_utils::report_metrics(masked_rendered_image, masked_gt_image, this->lpips_model_);
             }
 
-            if(kf_params_.debug_){
-                std::cout<<"[GaussianMapper::optimizeLocalLRPose] classic pose fid "<<pkf->fid_<<" GMS confidence "<<confidence
-                    <<" inliers "<<inliers.size()<<"/"<<good_matches
-                    <<" loss before "<<loss.item<float>()
-                    <<" loss after "<<updated_loss.item<float>()<<std::endl;
-            }
+            
         }
         if(confidence <= 0.f){
             std::cout<<"[error][GaussianMapper::optimizeLocalLRPose] PnP pose estimation for fid "<<pkf->fid_<<" failed after "<<this->max_pnp_render_attempts_<<" attempts!"<<std::endl;
@@ -4054,6 +3812,456 @@ float GaussianMapper::optimizeLocalLRPose(
         */
     }
     return loss.item<float>();
+}
+
+float GaussianMapper::optimizeLocalLRPoses(std::vector<std::size_t>& fids) {
+    std::vector<std::shared_ptr<GaussianKeyframe>> pkfs;
+    std::vector<torch::Tensor> rendered_images, gt_images, gt_depths, valid_masks;
+    std::vector<cv::Mat> gt_depths_cv, rendered_depths_cv;
+    std::vector<float> losses;
+
+    // get last frame of previous batch
+    auto prev_batch = std::prev(this->local_mapping_batch_ids_.end(), 2);
+    auto prev_fid = prev_batch->second.back();
+    {
+        torch::NoGradGuard no_grad;
+
+        auto pkf_prev = scene_->getKeyframe(prev_fid);
+        auto render_pkg = GaussianRenderer::render(pkf_prev,
+            this->kf_params_.lr_height_, this->kf_params_.lr_width_,
+            this->gaussians_, this->pipe_params_,
+            this->background_, this->override_color_,
+            false, true, true, true
+        );
+
+        auto rendered_image = std::get<0>(render_pkg);
+        auto rendered_depth = std::get<4>(render_pkg);
+        auto rendered_opacity = std::get<5>(render_pkg);
+
+        auto opacity_mask = (rendered_opacity > 0.3f).to(torch::kFloat32).squeeze();
+
+        auto gt_image = pkf_prev->getGTLRImg(true);
+        auto gt_depth = pkf_prev->getGTLRDpt(false);
+        auto gt_depth_mask = pkf_prev->getGTLRDptMsk(true); 
+
+        auto valid_mask = opacity_mask * gt_depth_mask;
+        rendered_image = valid_mask.unsqueeze(0) * rendered_image;
+
+        rendered_images.push_back(rendered_image);
+        gt_images.push_back(gt_image);
+        gt_depths.push_back(gt_depth);
+        // valid_masks.push_back(valid_mask);
+
+        auto gt_depth_cpu = gt_depth.squeeze().contiguous();
+        cv::Mat gt_depth_cv(gt_depth_cpu.size(0), gt_depth_cpu.size(1), CV_32F);
+        std::memcpy(gt_depth_cv.data, gt_depth_cpu.data_ptr<float>(), sizeof(float)*gt_depth_cpu.size(0)*gt_depth_cpu.size(1));
+        gt_depths_cv.push_back(gt_depth_cv);
+
+        // auto rendered_depth_cpu = rendered_depth.squeeze().to(torch::kCPU).contiguous();
+        // cv::Mat rendered_depth_cv(rendered_depth_cpu.size(0), rendered_depth_cpu.size(1), CV_32F);
+        // std::memcpy(rendered_depth_cv.data, rendered_depth_cpu.data_ptr<float>(), sizeof(float)*rendered_depth_cpu.size(0)*rendered_depth_cpu.size(1));
+        // rendered_depths_cv.push_back(rendered_depth_cv);
+
+        pkfs.push_back(std::move(pkf_prev));
+    }
+
+    for (int i=0; i<fids.size(); i++){
+        torch::NoGradGuard no_grad;
+
+        auto pkf = scene_->getKeyframe(fids[i]);
+
+        auto render_pkg = GaussianRenderer::render(pkf,
+            this->kf_params_.lr_height_, this->kf_params_.lr_width_,
+            this->gaussians_, this->pipe_params_,
+            this->background_, this->override_color_,
+            false, true, true, true
+        );
+
+        auto rendered_image = std::get<0>(render_pkg);
+        auto rendered_depth = std::get<4>(render_pkg);
+        auto rendered_opacity = std::get<5>(render_pkg);
+
+        auto opacity_mask = (rendered_opacity > 0.3f).to(torch::kFloat32).squeeze();
+
+        auto gt_image = pkf->getGTLRImg(true);
+        auto gt_depth = pkf->getGTLRDpt(false);
+        auto gt_depth_mask = pkf->getGTLRDptMsk(true); 
+
+        auto valid_mask = opacity_mask * gt_depth_mask;
+
+        auto loss = loss_utils::get_loss_rgbd(
+            rendered_image, gt_image,
+            rendered_depth, gt_depth,
+            this->lambdaDssim(),
+            this->global_align_lr_depth_lambda_,
+            pkf->exposure_a_, pkf->exposure_b_,
+            valid_mask,
+            device_type_
+        );
+        losses.push_back(loss.item<float>()); // !!! size of losses is smaller than pkfs by 1, since we don't compute loss for the first frame of previous batch
+
+        rendered_image = valid_mask.unsqueeze(0) * rendered_image; // put it after loss computation
+
+        rendered_images.push_back(rendered_image);
+        gt_images.push_back(gt_image);
+        gt_depths.push_back(gt_depth);
+        // valid_masks.push_back(valid_mask);
+
+        auto gt_depth_cpu = gt_depth.squeeze().contiguous();
+        cv::Mat gt_depth_cv(gt_depth_cpu.size(0), gt_depth_cpu.size(1), CV_32F);
+        std::memcpy(gt_depth_cv.data, gt_depth_cpu.data_ptr<float>(), sizeof(float)*gt_depth_cpu.size(0)*gt_depth_cpu.size(1));
+        gt_depths_cv.push_back(gt_depth_cv);
+
+        // auto rendered_depth_cpu = rendered_depth.squeeze().to(torch::kCPU).contiguous();
+        // cv::Mat rendered_depth_cv(rendered_depth_cpu.size(0), rendered_depth_cpu.size(1), CV_32F);
+        // std::memcpy(rendered_depth_cv.data, rendered_depth_cpu.data_ptr<float>(), sizeof(float)*rendered_depth_cpu.size(0)*rendered_depth_cpu.size(1));
+        // rendered_depths_cv.push_back(rendered_depth_cv);
+
+        pkfs.push_back(std::move(pkf));
+    }
+
+    int render_attempts = 0;
+    std::vector<bool> valid_updates(fids.size(), false);
+    while(render_attempts < this->max_pnp_render_attempts_){
+        std::vector<torch::Tensor> final_delta_poses, prev_base_poses;
+        
+        for (int i=1; i<pkfs.size(); i++){
+            if (valid_updates[i-1]) continue;
+
+            auto& cur_pkf = pkfs[i];
+            auto& prev_pkf = pkfs[i-1];
+            std::cout<<"[GaussianMapper::optimizeLocalLRPoses] optimizing local LR pose for fid "<<cur_pkf->fid_<<" with previous frame fid "<<prev_pkf->fid_<<std::endl;
+
+            // pnp linkage 3d -> 2d: prev gt -> cur rendered, cur gt -> cur rendered
+            std::vector<cv::KeyPoint> kpts_cur_gt, kpts_prev_gt, kpts_cur_rendered;
+            std::vector<int> matches_curgt2rendered, matches_rendered2curgt, matches_prevgt2rendered, matches_rendered2prevgt;
+        
+            // cur gt -> cur rendered
+            int good_matches_curgt2rendered = cur_pkf->matchLROrbGMS(rendered_images[i], 
+                kpts_cur_rendered, kpts_cur_gt,
+                matches_rendered2curgt, matches_curgt2rendered
+            );
+            std::cout<<"[GaussianMapper::optimizeLocalLRPoses] BA cur gt -> cur found "<<good_matches_curgt2rendered<<" good matches."<<std::endl;
+        
+            // prev gt -> cur rendered
+            kpts_cur_rendered.clear();
+            int good_matches_prevgt2rendered = prev_pkf->matchLROrbGMS(rendered_images[i], 
+                kpts_cur_rendered, kpts_prev_gt,
+                matches_rendered2prevgt, matches_prevgt2rendered
+            );
+            std::cout<<"[GaussianMapper::optimizeLocalLRPoses] BA prev gt -> cur found "<<good_matches_prevgt2rendered<<" good matches."<<std::endl;
+            
+            // temp keep it here
+            if (good_matches_curgt2rendered == 0) 
+                throw std::runtime_error("[GaussianMapper::optimizeLocalLRPoses] No valid matches for cur gt -> cur rendered for fid "+std::to_string(cur_pkf->fid_));
+
+            // related pose
+            cv::Mat cur_rvec, cur_tvec, prev_rvec, prev_tvec;
+            std::vector<int> cur_inliers, prev_inliers;
+            cv::Mat K_lr = (cv::Mat_<float>(3,3) << 
+                kf_params_.lr_fx_, 0.f, kf_params_.lr_cx_,
+                0.f, kf_params_.lr_fy_, kf_params_.lr_cy_,
+                0.f, 0.f, 1.f
+            );
+
+            float confidence_curgt2rendered = this->getRelatedPoseGMS(
+                cur_pkf,
+                kpts_cur_gt, kpts_cur_rendered,
+                matches_curgt2rendered,
+                gt_depths_cv[i],
+                K_lr,
+                cur_rvec, cur_tvec,
+                cur_inliers
+            );
+            float confidence_prevgt2rendered = this->getRelatedPoseGMS(
+                prev_pkf,
+                kpts_prev_gt, kpts_cur_rendered,
+                matches_prevgt2rendered,
+                gt_depths_cv[i-1],
+                K_lr,
+                prev_rvec, prev_tvec,
+                prev_inliers
+            );
+
+            std::cout<<"[GaussianMapper::optimizeLocalLRPoses] BA related pose confidence for fid "<<cur_pkf->fid_<<" : cur gt -> cur rendered confidence "<<confidence_curgt2rendered<<" with "<<cur_inliers.size()<<"/"<<good_matches_curgt2rendered<<" inliers, prev gt -> cur rendered confidence "<<confidence_prevgt2rendered<<" with "<<prev_inliers.size()<<"/"<<good_matches_prevgt2rendered<<" inliers."<<std::endl;
+
+            // average the two related poses
+            torch::Tensor final_delta_pose = torch::eye(4, 4).to(torch::kFloat32).to(device_type_);
+            if (confidence_curgt2rendered > 0.f && confidence_prevgt2rendered > 0.f){
+                auto cur_delta_pose = general_utils::vecs2transformation(cur_rvec, cur_tvec);
+                auto prev_delta_pose = general_utils::vecs2transformation(prev_rvec, prev_tvec);
+
+                auto cur_delta_pose_torch = torch::from_blob(cur_delta_pose.ptr<float>(), {4, 4}, torch::kFloat32).to(device_type_);
+                auto prev_delta_pose_torch = torch::from_blob(prev_delta_pose.ptr<float>(), {4, 4}, torch::kFloat32).to(device_type_);
+
+                // real delta pose of cur, gt (3d) -> cur (2d), gt (3d) <- cur (2d) needs inverse
+                cur_delta_pose_torch = cur_delta_pose_torch.inverse();
+                prev_delta_pose_torch = prev_delta_pose_torch.inverse();
+
+                // prev_delta_pose_torch = real_prev_delta_pose_torch.mm(prev to cur related pose)
+                auto prev_to_cur_related_pose = cur_pkf->getBasePose().mm(prev_pkf->getBasePose().inverse());
+                auto real_prev_delta_pose_torch = prev_delta_pose_torch.mm(prev_to_cur_related_pose);
+
+                final_delta_pose = tensor_utils::average_poses({cur_delta_pose_torch, real_prev_delta_pose_torch}, {confidence_curgt2rendered, confidence_prevgt2rendered});
+            }
+            else if (confidence_curgt2rendered > 0.f){
+                auto cur_delta_pose = general_utils::vecs2transformation(cur_rvec, cur_tvec);
+                final_delta_pose = torch::from_blob(cur_delta_pose.ptr<float>(), {4, 4}, torch::kFloat32).to(device_type_);
+            }
+            else if (confidence_prevgt2rendered > 0.f){
+                auto prev_delta_pose = general_utils::vecs2transformation(prev_rvec, prev_tvec);
+                final_delta_pose = torch::from_blob(prev_delta_pose.ptr<float>(), {4, 4}, torch::kFloat32).to(device_type_);
+            }
+            else{
+                std::cout<<"[GaussianMapper::optimizeLocalLRPoses] BA related pose estimation failed for fid "<<cur_pkf->fid_<<", set final delta pose to identity."<<std::endl;
+            }
+            final_delta_poses.push_back(final_delta_pose);
+        }
+
+        // apply the final delta poses
+        for (int i=1; i<pkfs.size(); i++){
+            if (valid_updates[i-1]) continue;
+
+            auto& pkf = pkfs[i];
+            prev_base_poses.push_back(pkf->getBasePose().clone());
+            auto updated_base_pose = final_delta_poses[i-1].mm(pkf->getBasePose());
+            pkf->setBasePose(updated_base_pose);
+
+            {
+                torch::NoGradGuard no_grad;
+
+                auto render_pkg = GaussianRenderer::render(pkf,
+                    this->kf_params_.lr_height_, this->kf_params_.lr_width_,
+                    this->gaussians_, this->pipe_params_,
+                    this->background_, this->override_color_,
+                    false, true, true, true
+                );
+
+                auto rendered_image = std::get<0>(render_pkg);
+                auto rendered_depth = std::get<4>(render_pkg);
+                auto rendered_opacity = std::get<5>(render_pkg);
+
+                auto gt_depth_mask = pkf->getGTLRDptMsk(true);  
+
+                auto opacity_mask = (rendered_opacity > 0.3f).to(torch::kFloat32).squeeze();
+                auto valid_mask = opacity_mask * gt_depth_mask;
+
+                auto loss = loss_utils::get_loss_rgbd(
+                    rendered_image, gt_images[i],
+                    rendered_depth, gt_depths[i],
+                    this->lambdaDssim(),
+                    this->global_align_lr_depth_lambda_,
+                    pkf->exposure_a_, pkf->exposure_b_,
+                    valid_mask,
+                    device_type_
+                );
+
+                if (loss.item<float>() > losses[i-1]){
+                    std::cout<<"[GaussianMapper::optimizeLocalLRPoses] BA rendered RGBD LR pose update for fid "<<pkf->fid_<<" increases loss from "<<losses[i-1]<<" to "<<loss.item<float>()<<", revert pose update."<<std::endl;
+                    pkf->setBasePose(prev_base_poses[i-1]);
+                    valid_updates[i-1] = false;
+                }
+                else{
+                    std::cout<<"[GaussianMapper::optimizeLocalLRPoses] BA rendered RGBD LR pose update for fid "<<pkf->fid_<<" decreases loss from "<<losses[i-1]<<" to "<<loss.item<float>()<<", keep pose update."<<std::endl;
+                    valid_updates[i-1] = true;
+                }
+
+                rendered_images[i] = valid_mask.unsqueeze(0) * rendered_image;
+                losses[i-1] = loss.item<float>();
+
+                if(kf_params_.debug_){
+                    CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lr_train_pose_ba"))
+
+                    auto masked_rendered_image = rendered_image * valid_mask.unsqueeze(0);
+                    auto masked_gt_image = gt_images[i] * valid_mask.unsqueeze(0);
+
+                    auto image_cv = tensor_utils::torchTensor2CvMat_Float32(rendered_image);
+                    cv::cvtColor(image_cv, image_cv, CV_RGB2BGR);
+                    image_cv.convertTo(image_cv, CV_8UC3, 255.0f);
+                    cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lr_train_pose_ba" / (std::to_string(pkf->fid_)+"_"+std::to_string(render_attempts)+"_ba.jpg"), image_cv);
+                    if (render_attempts == 0){
+                        auto gt_cv = tensor_utils::torchTensor2CvMat_Float32(masked_gt_image);
+                        cv::cvtColor(gt_cv, gt_cv, CV_RGB2BGR);
+                        gt_cv.convertTo(gt_cv, CV_8UC3, 255.0f);
+                        cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lr_train_pose_ba" / (std::to_string(pkf->fid_)+"_gt.jpg"), gt_cv);
+                    }
+                    metrics_utils::report_metrics(masked_rendered_image, masked_gt_image, this->lpips_model_);
+                }
+            }
+        }
+
+        // all valid break
+        if (std::all_of(valid_updates.begin(), valid_updates.end(), [](bool v){ return v; })){
+            std::cout<<"[GaussianMapper::optimizeLocalLRPoses] all BA pose updates are valid after "<<render_attempts<<" attempts, break."<<std::endl;
+            break;
+        }
+        else{ 
+            std::cout<<"[GaussianMapper::optimizeLocalLRPoses] not all BA pose updates are valid, re-rendering "<<render_attempts+1<<"/"<<this->max_pnp_render_attempts_<<"..."<<std::endl;
+            render_attempts++;
+        }
+    }
+
+   /*
+
+    // local ba for: prev, 0, 1, 2, ..., n-1
+    std::vector<torch::Tensor> final_delta_poses;
+    for (int i=1; i<pkfs.size(); i++){
+        auto& cur_pkf = pkfs[i];
+        auto& prev_pkf = pkfs[i-1];
+
+        // pnp linkage 3d -> 2d: prev gt -> cur rendered, cur gt -> cur rendered
+        std::vector<cv::KeyPoint> kpts_cur_gt, kpts_prev_gt, kpts_cur_rendered;
+        std::vector<int> matches_curgt2rendered, matches_rendered2curgt, matches_prevgt2rendered, matches_rendered2prevgt;
+    
+        // cur gt -> cur rendered
+        int good_matches_curgt2rendered = cur_pkf->matchLROrbGMS(rendered_images[i], 
+            kpts_cur_rendered, kpts_cur_gt,
+            matches_rendered2curgt, matches_curgt2rendered
+        );
+        std::cout<<"[GaussianMapper::optimizeLocalLRPoses] BA cur gt -> cur rendered for fid "<<cur_pkf->fid_<<" found "<<good_matches_curgt2rendered<<" good matches."<<std::endl;
+    
+        // prev gt -> cur rendered
+        kpts_cur_rendered.clear();
+        int good_matches_prevgt2rendered = prev_pkf->matchLROrbGMS(rendered_images[i], 
+            kpts_cur_rendered, kpts_prev_gt,
+            matches_rendered2prevgt, matches_prevgt2rendered
+        );
+        std::cout<<"[GaussianMapper::optimizeLocalLRPoses] BA prev gt -> cur rendered for fid "<<prev_pkf->fid_<<" found "<<good_matches_prevgt2rendered<<" good matches."<<std::endl;
+        
+        // related pose
+        cv::Mat cur_rvec, cur_tvec, prev_rvec, prev_tvec;
+        std::vector<int> cur_inliers, prev_inliers;
+        cv::Mat K_lr = (cv::Mat_<float>(3,3) << 
+            kf_params_.lr_fx_, 0.f, kf_params_.lr_cx_,
+            0.f, kf_params_.lr_fy_, kf_params_.lr_cy_,
+            0.f, 0.f, 1.f
+        );
+
+        float confidence_curgt2rendered = this->getRelatedPoseGMS(
+            cur_pkf,
+            kpts_cur_gt, kpts_cur_rendered,
+            matches_curgt2rendered,
+            gt_depths_cv[i],
+            K_lr,
+            cur_rvec, cur_tvec,
+            cur_inliers
+        );
+
+        float confidence_prevgt2rendered = this->getRelatedPoseGMS(
+            prev_pkf,
+            kpts_prev_gt, kpts_cur_rendered,
+            matches_prevgt2rendered,
+            gt_depths_cv[i-1],
+            K_lr,
+            prev_rvec, prev_tvec,
+            prev_inliers
+        );
+
+        std::cout<<"[GaussianMapper::optimizeLocalLRPoses] BA related pose confidence for fid "<<cur_pkf->fid_<<" : cur gt -> cur rendered confidence "<<confidence_curgt2rendered<<" with "<<cur_inliers.size()<<"/"<<good_matches_curgt2rendered<<" inliers, prev gt -> cur rendered confidence "<<confidence_prevgt2rendered<<" with "<<prev_inliers.size()<<"/"<<good_matches_prevgt2rendered<<" inliers."<<std::endl;
+        
+        // average the two related poses
+        torch::Tensor final_delta_pose = torch::eye(4, 4).to(torch::kFloat32).to(device_type_);
+        if (confidence_curgt2rendered > 0.f && confidence_prevgt2rendered > 0.f){
+            auto cur_delta_pose = general_utils::vecs2transformation(cur_rvec, cur_tvec);
+            auto prev_delta_pose = general_utils::vecs2transformation(prev_rvec, prev_tvec);
+
+            auto cur_delta_pose_torch = torch::from_blob(cur_delta_pose.ptr<float>(), {4, 4}, torch::kFloat32).to(device_type_);
+            auto prev_delta_pose_torch = torch::from_blob(prev_delta_pose.ptr<float>(), {4, 4}, torch::kFloat32).to(device_type_);
+
+            // real delta pose of cur, gt (3d) -> cur (2d), gt (3d) <- cur (2d) needs inverse
+            cur_delta_pose_torch = cur_delta_pose_torch.inverse();
+            prev_delta_pose_torch = prev_delta_pose_torch.inverse();
+
+            // prev_delta_pose_torch = real_prev_delta_pose_torch.mm(prev to cur related pose)
+            auto prev_to_cur_related_pose = cur_pkf->getBasePose().mm(prev_pkf->getBasePose().inverse());
+            auto real_prev_delta_pose_torch = prev_delta_pose_torch.mm(prev_to_cur_related_pose);
+
+            final_delta_pose = tensor_utils::average_poses({cur_delta_pose_torch, real_prev_delta_pose_torch}, {confidence_curgt2rendered, confidence_prevgt2rendered});
+
+            std::cout<<"[debug] cur_delta_pose_torch:\n"<<cur_delta_pose_torch<<std::endl;
+            std::cout<<"[debug] prev_delta_pose_torch:\n"<<prev_delta_pose_torch<<std::endl;
+            std::cout<<"[debug] real_prev_delta_pose_torch:\n"<<real_prev_delta_pose_torch<<std::endl;
+            std::cout<<"[debug] final_delta_pose:\n"<<final_delta_pose<<std::endl;
+        }
+        else if (confidence_curgt2rendered > 0.f){
+            auto cur_delta_pose = general_utils::vecs2transformation(cur_rvec, cur_tvec);
+            final_delta_pose = torch::from_blob(cur_delta_pose.ptr<float>(), {4, 4}, torch::kFloat32).to(device_type_);
+        }
+        else if (confidence_prevgt2rendered > 0.f){
+            auto prev_delta_pose = general_utils::vecs2transformation(prev_rvec, prev_tvec);
+            final_delta_pose = torch::from_blob(prev_delta_pose.ptr<float>(), {4, 4}, torch::kFloat32).to(device_type_);
+        }
+        else{
+            std::cout<<"[GaussianMapper::optimizeLocalLRPoses] BA related pose estimation failed for fid "<<cur_pkf->fid_<<", set final delta pose to identity."<<std::endl;
+        }
+        final_delta_poses.push_back(final_delta_pose);
+    }
+    
+    // update poses
+    std::vector<torch::Tensor> prev_base_poses;
+    for (int i=1; i<pkfs.size(); i++){
+        auto& pkf = pkfs[i];
+        prev_base_poses.push_back(pkf->getBasePose().clone());
+        auto updated_base_pose = final_delta_poses[i-1].mm(pkf->getBasePose());
+        pkf->setBasePose(updated_base_pose);
+    }
+
+    if(kf_params_.debug_){
+        torch::NoGradGuard no_grad;
+        CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lr_train_pose_ba"))
+
+        for (int i=1; i<pkfs.size(); i++){
+            auto& pkf = pkfs[i];
+
+            auto render_pkg = GaussianRenderer::render(pkf,
+                this->kf_params_.lr_height_, this->kf_params_.lr_width_,
+                this->gaussians_, this->pipe_params_,
+                this->background_, this->override_color_,
+                false, true, true, true
+            );
+
+            auto rendered_image = std::get<0>(render_pkg);
+            auto rendered_depth = std::get<4>(render_pkg);
+            auto rendered_opacity = std::get<5>(render_pkg);
+
+            auto opacity_mask = (rendered_opacity > 0.3f).to(torch::kFloat32).squeeze();
+
+            auto gt_image = pkf->getGTLRImg(true);
+            auto gt_depth = pkf->getGTLRDpt(true);
+            auto gt_depth_mask = pkf->getGTLRDptMsk(true); 
+
+            auto valid_mask = opacity_mask * gt_depth_mask;
+
+            auto loss = loss_utils::get_loss_rgbd(
+                rendered_image, gt_image,
+                rendered_depth, gt_depth,
+                this->lambdaDssim(),
+                this->global_align_lr_depth_lambda_,
+                pkf->exposure_a_, pkf->exposure_b_,
+                valid_mask,
+                device_type_
+            );
+
+            auto masked_rendered_image = rendered_image * valid_mask.unsqueeze(0);
+            auto masked_gt_image = gt_image * valid_mask.unsqueeze(0);
+
+            auto image_cv = tensor_utils::torchTensor2CvMat_Float32(rendered_image);
+            cv::cvtColor(image_cv, image_cv, CV_RGB2BGR);
+            image_cv.convertTo(image_cv, CV_8UC3, 255.0f);
+            cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lr_train_pose_ba" / (std::to_string(pkf->fid_)+"_ba.jpg"), image_cv);
+            auto gt_cv = tensor_utils::torchTensor2CvMat_Float32(gt_image);
+            cv::cvtColor(gt_cv, gt_cv, CV_RGB2BGR);
+            gt_cv.convertTo(gt_cv, CV_8UC3, 255.0f);
+            cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lr_train_pose_ba" / (std::to_string(pkf->fid_)+"_gt.jpg"), gt_cv);
+
+            std::cout<<"[GaussianMapper::optimizeLocalLRPoses] BA final pose for fid "<<pkf->fid_<<" loss after BA "<<loss.item<float>()<<", previous loss "<<losses[i-1].item<float>()<<std::endl;
+            metrics_utils::report_metrics(masked_rendered_image, masked_gt_image, this->lpips_model_);
+        }
+    }
+    // throw std::runtime_error("[GaussianMapper::optimizeLocalLRPoses] not implemented yet!");
+*/
+    
+    return 0.f; 
 }
 
 float GaussianMapper::optimizeLocalHRPose(std::shared_ptr<GaussianKeyframe> pkf, bool use_differential_pose)
@@ -4300,7 +4508,8 @@ float GaussianMapper::optimizeLocalHRPose(std::shared_ptr<GaussianKeyframe> pkf,
         }
 
         if(confidence <= 0.f){
-            std::cout<<"[error][GaussianMapper::optimizeLocalHRPose] PnP pose estimation for fid "<<pkf->fid_<<" failed after "<<this->max_pnp_render_attempts_<<" attempts!"<<std::endl;
+            std::cout<<"[error][GaussianMapper::optimizeLocalHRPose] For rendered RGBD HR, PnP pose estimation for fid "<<pkf->fid_<<" failed after "<<this->max_pnp_render_attempts_<<" attempts!"<<std::endl;
+            throw std::runtime_error("[GaussianMapper::optimizeLocalHRPose] PnP pose estimation failed!");
             return loss.item<float>();
         }
         else{
@@ -4404,7 +4613,7 @@ float GaussianMapper::optimizeLocalHRPose(std::shared_ptr<GaussianKeyframe> pkf,
         }
 
         if(confidence <= 0.f){
-            std::cout<<"[error][GaussianMapper::optimizeLocalHRPose] PnP pose estimation for fid "<<pkf->fid_<<" failed after "<<this->max_pnp_render_attempts_<<" attempts!"<<std::endl;
+            std::cout<<"[error][GaussianMapper::optimizeLocalHRPose] For HRLR cross RGBD HR pose, PnP pose estimation for fid "<<pkf->fid_<<" failed after "<<this->max_pnp_render_attempts_<<" attempts!"<<std::endl;
             return updated_loss.item<float>();
         }
 
@@ -4468,33 +4677,32 @@ float GaussianMapper::getRsizedHRScale(float ratio, int& out_width, int& out_hei
 }
 
 torch::Tensor GaussianMapper::getLocalLRValidDptMsk(std::shared_ptr<GaussianKeyframe> pkf){
-    torch::NoGradGuard no_grad;
-
     int kernel_size = 3;
 
-    // auto eye_pose = torch::eye(4).to(device_type_);
-    // auto global_delta_pose = pkf->getGlobalDeltaPose().clone();
-    // pkf->setGlobalDeltaPose(eye_pose);
-    // auto local_delta_pose = pkf->getLocalDeltaPose().clone();
-    // pkf->setLocalDeltaPose(eye_pose);
+    torch::Tensor rendered_image, rendered_opacity, valid_mask;
 
-    auto render_pkg = GaussianRenderer::render(pkf,
-        this->kf_params_.lr_height_, this->kf_params_.lr_width_,
-        this->gaussians_, this->pipe_params_,
-        this->background_, this->override_color_,
-        false, true, true, true
-    );
+    // {
+    //     std::unique_lock<std::mutex> lock_render(mutex_render_);
+        torch::NoGradGuard no_grad;
+        auto render_pkg = GaussianRenderer::render(pkf,
+            this->kf_params_.lr_height_, this->kf_params_.lr_width_,
+            this->gaussians_, this->pipe_params_,
+            this->background_, this->override_color_,
+            false, true, true, true
+        );
 
-    auto rendered_opacity = std::get<5>(render_pkg);
-    
-    // auto gt_image = pkf->getGTLRImg(true);
-    auto gt_depth = pkf->getGTLRDpt(true);
-    auto gt_depth_mask = pkf->getGTLRDptMsk(true);
+        rendered_image = std::get<0>(render_pkg);
+        rendered_opacity = std::get<5>(render_pkg);
+        
+        // auto gt_image = pkf->getGTLRImg(true);
+        auto gt_depth = pkf->getGTLRDpt(true);
+        auto gt_depth_mask = pkf->getGTLRDptMsk(true);
 
-    auto opacity_mask = (rendered_opacity < this->local_align_batch_fillholes_opacity_thr_).to(torch::kFloat32).squeeze();
+        auto opacity_mask = (rendered_opacity < this->local_align_batch_fillholes_opacity_thr_).to(torch::kFloat32).squeeze();
 
-    auto valid_mask = general_utils::dilate_mask(opacity_mask, 3) * gt_depth_mask;
-    
+        valid_mask = general_utils::dilate_mask(opacity_mask, 3) * gt_depth_mask;
+    // }
+
     auto labeled_mask = cc_torch::connected_components_labeling_2d(valid_mask.to(torch::kUInt8));
     auto filtered_mask = general_utils::merge_large_components(labeled_mask, this->local_align_batch_conn_comp_min_size_);
 
@@ -4519,7 +4727,6 @@ torch::Tensor GaussianMapper::getLocalLRValidDptMsk(std::shared_ptr<GaussianKeyf
         image_cv3.convertTo(image_cv3, CV_8UC1, 255.0f, 0.f);
         cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size()) + kf_params_.debug_dir_) / "lr_valid_dpt" / (std::to_string(pkf->fid_) + "_filtered.jpg"), image_cv3);
         
-        auto rendered_image = std::get<0>(render_pkg);
         auto image_cv4 = tensor_utils::torchTensor2CvMat_Float32(rendered_image);
         cv::cvtColor(image_cv4, image_cv4, CV_RGB2BGR);
         image_cv4.convertTo(image_cv4, CV_8UC3, 255.0f, 0.f);
@@ -4532,10 +4739,11 @@ torch::Tensor GaussianMapper::getLocalLRValidDptMsk(std::shared_ptr<GaussianKeyf
 }
 
 int GaussianMapper::insertLocalLRValidDpts(std::vector<torch::Tensor>& valid_depth_masks, std::vector<std::size_t>& valid_fids){
+    // std::unique_lock<std::mutex> lock_render(mutex_render_);
     torch::NoGradGuard no_grad;
     
     std::vector<std::size_t> sorted_valid_fids;
-
+    std::vector<torch::Tensor> sorted_valid_depth_masks;
     std::vector<std::pair<int, int>> fid_pixel_counts;
 
     // Build a map from fid to index for valid_depth_masks
@@ -4558,14 +4766,17 @@ int GaussianMapper::insertLocalLRValidDpts(std::vector<torch::Tensor>& valid_dep
     int max_pixel_fid = fid_pixel_counts.front().first;
     int max_pixel_count = fid_pixel_counts.front().second;
 
-    if(max_pixel_count < 1)
-        throw std::runtime_error("[GaussianMapper::insertLocalLRValidDpts] no valid depth pixels found in the batch!");
+    if(max_pixel_count < 1){
+        std::cout<<"[GaussianMapper::insertLocalLRValidDpts] no valid depth pixels found in the batch!"<<std::endl;
+        return -1;
+    }
 
-    auto& pkf_ref = this->scene_->keyframes_.at(max_pixel_fid);
+    // auto& pkf_ref = this->scene_->keyframes_.at(max_pixel_fid);
+    auto pkf_ref = this->scene_->getKeyframe(max_pixel_fid); // [debug 20260222]
     auto pose_ref = pkf_ref->getBasePose().clone();
     auto valid_depth_mask_ref = valid_depth_masks[fid_to_mask_idx[max_pixel_fid]];
+    // auto valid_depth_ref = pkf_ref->getGTLRDpt(true);
     auto valid_depth_ref = valid_depth_mask_ref * pkf_ref->getGTLRDpt(true);
-
     auto gt_image_ref = pkf_ref->getGTLRImg(true);
     this->gaussians_->increaseKeyframeInitPcd(pkf_ref, valid_depth_ref, gt_image_ref, this->kf_params_);
 
@@ -4579,6 +4790,70 @@ int GaussianMapper::insertLocalLRValidDpts(std::vector<torch::Tensor>& valid_dep
         cv::cvtColor(image_cv, image_cv, CV_RGB2BGR);
         image_cv.convertTo(image_cv, CV_8UC3, 255.0f, 0.f);
         cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size()) + kf_params_.debug_dir_) / "lr_depth_diff" / (std::to_string(max_pixel_fid) + "_main_image.jpg"), image_cv);
+        torch::Tensor opacity_mask, gt_depth;
+        {
+            torch::NoGradGuard no_grad;
+            auto render_pkg = GaussianRenderer::render(pkf_ref,
+                this->kf_params_.lr_height_, this->kf_params_.lr_width_,
+                this->gaussians_, this->pipe_params_,
+                this->background_, this->override_color_,
+                false, true, true, true
+            );
+            auto rendered_image = std::get<0>(render_pkg);
+            auto rendered_depth = std::get<4>(render_pkg);
+            auto rendered_opacity = std::get<5>(render_pkg);
+            opacity_mask = (rendered_opacity > 0.1f).to(torch::kFloat32).squeeze();
+            auto rendered_image_cv = tensor_utils::torchTensor2CvMat_Float32(rendered_image);
+            gt_depth = pkf_ref->getGTLRDpt(true);
+            cv::cvtColor(rendered_image_cv, rendered_image_cv, CV_RGB2BGR);
+            rendered_image_cv.convertTo(rendered_image_cv, CV_8UC3, 255.0f, 0.f);
+            cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size()) + kf_params_.debug_dir_) / "lr_depth_diff" / (std::to_string(max_pixel_fid) + "_main_render.jpg"), rendered_image_cv);
+            auto depth_diff = torch::abs(rendered_depth - gt_depth) * this->rendered_depthmap_factor_;
+            depth_diff = depth_diff * opacity_mask;
+            auto depth_diff_cv = tensor_utils::torchTensor2CvMat_Float32(depth_diff);
+            depth_diff_cv.convertTo(depth_diff_cv, CV_8UC1, 255.0f/2000.f, 0.f);
+            cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size()) + kf_params_.debug_dir_) / "lr_depth_diff" / (std::to_string(max_pixel_fid) + "_main_depth_diff.jpg"), depth_diff_cv); 
+        }
+        /*
+        {
+            auto valid_indices = torch::where(valid_depth_ref > 0.f);
+            auto valid_v = valid_indices[0];
+            auto valid_u = valid_indices[1];
+            auto linear_idx = valid_v * kf_params_.lr_width_ + valid_u;
+
+            auto z = valid_depth_ref.flatten().index_select(0, linear_idx);
+            auto x = (valid_u.to(torch::kFloat32) - kf_params_.lr_cx_) * z * (1.f / kf_params_.lr_fx_);
+            auto y = (valid_v.to(torch::kFloat32) - kf_params_.lr_cy_) * z * (1.f / kf_params_.lr_fy_);
+
+            auto Pc = torch::stack({x, y, z}, 1); // N x 3
+            auto Pc_homo = torch::cat({Pc, torch::ones({Pc.size(0), 1}, Pc.options())}, 1); // N x 4
+            auto Pw = pkf_ref->getBasePose().inverse().mm(Pc_homo.transpose(0, 1)); // 4 x N
+            auto Pc_back = pkf_ref->getBasePose().mm(Pw); // 4 x N
+            auto x_back = Pc_back.index({torch::indexing::Slice(0, 1), torch::indexing::Slice()}).squeeze(); // N
+            auto y_back = Pc_back.index({torch::indexing::Slice(1, 2), torch::indexing::Slice()}).squeeze(); // N
+            auto z_back = Pc_back.index({torch::indexing::Slice(2, 3), torch::indexing::Slice()}).squeeze(); // N
+            std::cout<<"[debug] x_back sizes: "<<x_back.sizes()<<std::endl;
+
+            auto u_back = (x_back / z_back * kf_params_.lr_fx_ + kf_params_.lr_cx_).round().to(torch::kInt32);
+            auto v_back = (y_back / z_back * kf_params_.lr_fy_ + kf_params_.lr_cy_).round().to(torch::kInt32);
+
+            u_back = torch::clamp(u_back, 0, kf_params_.lr_width_ - 1);
+            v_back = torch::clamp(v_back, 0, kf_params_.lr_height_ - 1);
+            auto depth_back = torch::zeros({kf_params_.lr_height_, kf_params_.lr_width_}, z_back.options());
+            depth_back.index_put_({v_back, u_back}, z_back);
+            std::cout<<"[debug] depth back mean "<<depth_back.mean().item<float>()<<" gt depth mean "<<gt_depth.mean().item<float>()<<std::endl;
+            auto depth_diff = torch::abs(depth_back - gt_depth);
+            depth_diff = depth_diff * opacity_mask;
+            auto depth_diff_cv = tensor_utils::torchTensor2CvMat_Float32(depth_diff);
+            depth_diff_cv = depth_diff_cv * this->rendered_depthmap_factor_;
+            depth_diff_cv.convertTo(depth_diff_cv, CV_8UC1, 255.0f/2000.f, 0.f);
+            cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size()) + kf_params_.debug_dir_) / "lr_depth_diff" / (std::to_string(max_pixel_fid) + "_back_depth_diff.jpg"), depth_diff_cv); 
+            auto depth_back_cv = tensor_utils::torchTensor2CvMat_Float32(depth_back);
+            depth_back_cv = depth_back_cv * this->rendered_depthmap_factor_;
+            depth_back_cv.convertTo(depth_back_cv, CV_8UC1, 255.0f/2000.f, 0.f);
+            cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size()) + kf_params_.debug_dir_) / "lr_depth_diff" / (std::to_string(max_pixel_fid) + "_back_depth.jpg"), depth_back_cv);
+        }
+        */
     }
 
     torch::Tensor accumulated_valid_depth = valid_depth_mask_ref.flatten();
@@ -4586,7 +4861,8 @@ int GaussianMapper::insertLocalLRValidDpts(std::vector<torch::Tensor>& valid_dep
         sorted_valid_fids.push_back(kfid);
         if(kfid == max_pixel_fid) continue;
 
-        auto& pkf = this->scene_->keyframes_.at(kfid);
+        // auto& pkf = this->scene_->keyframes_.at(kfid);
+        auto pkf = this->scene_->getKeyframe(kfid); // [debug 20260222]
 
         auto gt_depth = pkf->getGTLRDpt(true);
         auto gt_image = pkf->getGTLRImg(true);
@@ -4672,23 +4948,63 @@ int GaussianMapper::insertLocalLRValidDpts(std::vector<torch::Tensor>& valid_dep
     }
 
     valid_fids = sorted_valid_fids;
+    for (int i=0; i<valid_fids.size(); ++i) {
+        sorted_valid_depth_masks.push_back(valid_depth_masks[fid_to_mask_idx[valid_fids[i]]]);
+    }
+    valid_depth_masks = sorted_valid_depth_masks;
+
+    if(kf_params_.debug_){
+        torch::NoGradGuard no_grad;
+        for (int i=0; i<valid_fids.size(); ++i) {
+            // auto& pkf = this->scene_->keyframes_.at(valid_fids[i]);
+            auto pkf = this->scene_->getKeyframe(valid_fids[i]); // [debug 20260222]
+            auto render_pkg = GaussianRenderer::render(pkf,
+                this->kf_params_.lr_height_, this->kf_params_.lr_width_,
+                this->gaussians_, this->pipe_params_,
+                this->background_, this->override_color_,
+                false, true, true, true
+            );
+
+            auto rendered_image = std::get<0>(render_pkg);
+            auto rendered_opacity = std::get<5>(render_pkg);
+            auto opacity_mask = (rendered_opacity > 0.01f).to(torch::kFloat32).squeeze();
+            auto masked_rendered_image = rendered_image * opacity_mask.unsqueeze(0);
+            auto gt_image = pkf->getGTLRImg(true);
+            auto masked_gt_image = gt_image * opacity_mask.unsqueeze(0);
+
+            std::cout<<"[GaussianMapper::insertLocalLRValidDpts] final metrics fid "<<pkf->fid_<<std::endl;
+            metrics_utils::report_metrics(masked_rendered_image, masked_gt_image, this->lpips_model_);
+
+            auto image_cv = tensor_utils::torchTensor2CvMat_Float32(rendered_image);
+            cv::cvtColor(image_cv, image_cv, CV_RGB2BGR);
+            image_cv.convertTo(image_cv, CV_8UC3, 255.0f, 0.f);
+            CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size()) + kf_params_.debug_dir_) / "lr_depth_diff"))
+            cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size()) + kf_params_.debug_dir_) / "lr_depth_diff" / (std::to_string(pkf->fid_) + "_final.jpg"), image_cv);
+        }
+
+    }
 
     return max_pixel_fid;
 }
 
-void GaussianMapper::optimizeInsertedLocalLRDpts(std::vector<std::size_t>& valid_fids){
-    float main_fid_ratio = 0.4f;
+void GaussianMapper::optimizeInsertedLocalLRDpts(
+    std::vector<std::size_t>& valid_fids, std::vector<torch::Tensor>& valid_depth_masks
+){
+    // std::unique_lock<std::mutex> lock_render(mutex_render_);
+    // float main_fid_ratio = 0.4f;
+    float add_loss_weight = 0.6f;
 
     std::vector<torch::Tensor> opacity_masks(valid_fids.size(), torch::Tensor());
-    std::vector<torch::Tensor> init_local_delta_poses(valid_fids.size(), torch::Tensor());
+    std::vector<torch::Tensor> init_base_poses(valid_fids.size(), torch::Tensor());
     std::vector<torch::Tensor> joint_gs_masks(valid_fids.size(), torch::Tensor());
     bool fix_xyz_geo = false;
     for(int i=0; i<this->local_align_lr_joint_pose_iter_; ++i){
         torch::Tensor batch_loss = torch::zeros({1}, torch::TensorOptions().device(device_type_).dtype(torch::kFloat32));
         for(int idx=0; idx<valid_fids.size(); ++idx){
-            auto& pkf = this->scene_->keyframes_.at(valid_fids[idx]);
+            // auto& pkf = this->scene_->keyframes_.at(valid_fids[idx]);
+            auto pkf = this->scene_->getKeyframe(valid_fids[idx]); // [debug 20260222]
 
-            if(i == 0) pkf->updateOptimizer(0.8f);
+            if(i == 0) pkf->updateOptimizer(0.6f);
 
             if(i >= this->local_align_lr_joint_pose_iter_/2 && fix_xyz_geo) fix_xyz_geo = false;
             
@@ -4712,9 +5028,11 @@ void GaussianMapper::optimizeInsertedLocalLRDpts(std::vector<std::size_t>& valid
                 opacity_masks[idx] = opacity_mask;
                 valid_mask = gt_depth_mask * opacity_mask;
 
-                init_local_delta_poses[idx] = pkf->getLocalDeltaPose().clone();
+                init_base_poses[idx] = pkf->getBasePose().clone();
             }
             else valid_mask = gt_depth_mask * opacity_masks[idx];
+            // auto opacity_mask = (rendered_opacity > 0.01f).to(torch::kFloat32).squeeze();
+            // auto valid_mask = gt_depth_mask * opacity_mask;
 
             // auto loss = loss_utils::get_loss_depth(
             //     rendered_depth, gt_depth,
@@ -4722,13 +5040,24 @@ void GaussianMapper::optimizeInsertedLocalLRDpts(std::vector<std::size_t>& valid
             //     device_type_
             // );
 
-            auto loss = loss_utils::get_loss_rgbd(
+            auto full_loss = loss_utils::get_loss_rgbd(
                 rendered_image, gt_image,
                 rendered_depth, gt_depth,
-                0.6f, 0.8f,
+                0.8f, 0.6f,
                 pkf->exposure_a_, pkf->exposure_b_,
                 valid_mask
             );
+
+            auto added_loss = loss_utils::get_loss_rgbd(
+                rendered_image, gt_image,
+                rendered_depth, gt_depth,
+                0.8f, 0.6f,
+                pkf->exposure_a_, pkf->exposure_b_,
+                valid_mask * valid_depth_masks[idx]
+            );
+
+            auto loss = (1.f - add_loss_weight) * full_loss + add_loss_weight * added_loss;
+            std::cout<<"[debug 02220043] loss "<<loss.item<float>()<<" full_loss "<<full_loss.item<float>()<<" added_loss "<<added_loss.item<float>()<<" id "<<pkf->fid_<<" iter "<<i<<std::endl;
 
             // if(idx == 0) loss *= main_fid_ratio;
             // else loss *= (1.f-main_fid_ratio) * (1.f/float(valid_fids.size()-1));
@@ -4736,7 +5065,7 @@ void GaussianMapper::optimizeInsertedLocalLRDpts(std::vector<std::size_t>& valid
 
             if(i==0) batch_loss += loss;
             else{
-                auto updated_delta_pose = pkf->getLocalDeltaPose() * init_local_delta_poses[idx].inverse();
+                auto updated_delta_pose = pkf->getBasePose() * init_base_poses[idx].inverse();
                 auto pose_loss = loss_utils::get_loss_posereg(updated_delta_pose, 0.5f);
                 // auto pose_loss = loss_utils::get_loss_posereg(updated_delta_pose, 0.7f) * (1.f/float(valid_fids.size()));
                 batch_loss += (loss + 10.f * pose_loss);
@@ -4752,31 +5081,35 @@ void GaussianMapper::optimizeInsertedLocalLRDpts(std::vector<std::size_t>& valid
             torch::NoGradGuard no_grad;
 
             // if(i >= this->local_align_lr_joint_pose_iter_/2)
-            gaussians_->updateBatchGradients(valid_fids, 1.8f);
+            // gaussians_->updateBatchGradients(valid_fids, 1.8f);
             
             gaussians_->optimizer_->step();
             gaussians_->optimizer_->zero_grad(true);
 
             for(int idx=0; idx<valid_fids.size(); ++idx){
-                auto& pkf = this->scene_->keyframes_.at(valid_fids[idx]);
+                // auto& pkf = this->scene_->keyframes_.at(valid_fids[idx]);
+                auto pkf = this->scene_->getKeyframe(valid_fids[idx]); // [debug 20260222]
                 
                 pkf->stepOptimizer(true, false);
                 pkf->zeroOptimizerGrad(true, true);
                 
+                auto delta_pose = torch::eye(4, torch::TensorOptions().device(device_type_).dtype(torch::kFloat32));
+                bool has_updated = pkf->updateBasePose(delta_pose, true);
+                if (!has_updated) continue;
+                auto updated_pose = pkf->getBasePose().clone();
+                // std::cout<<"[debug] updated getBasePose\n"<<updated_pose<<std::endl;
+                // std::cout<<"[debug] delta getBasePose\n"<<delta_pose<<std::endl;
 
-                // std::cout<<"[debug] check1\n"<<pkf->getBasePose()<<std::endl;
-                torch::Tensor delta_pose;
-                pkf->updateBasePose(delta_pose, true);
-                // std::cout<<"[debug] check2\n"<<delta_pose<<std::endl;
-                // std::cout<<"[debug] check3\n"<<pkf->getBasePose()<<std::endl;
+                this->gaussians_->updateKeyframeJointPcd(pkf, updated_pose, delta_pose, joint_gs_masks[idx]);
 
-                this->gaussians_->updateKeyframeJointPcd(pkf, delta_pose, joint_gs_masks[idx]);
+
             }
 
             if(kf_params_.debug_){
                 CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lr_train_depth"))
                 for(int idx=0; idx<valid_fids.size(); ++idx){
-                    auto& pkf = this->scene_->keyframes_.at(valid_fids[idx]);
+                    // auto& pkf = this->scene_->keyframes_.at(valid_fids[idx]);
+                    auto pkf = this->scene_->getKeyframe(valid_fids[idx]); // [debug 20260222]
                     auto render_pkg = GaussianRenderer::render(pkf,
                         this->kf_params_.lr_height_, this->kf_params_.lr_width_,
                         this->gaussians_, this->pipe_params_,
@@ -4809,9 +5142,14 @@ void GaussianMapper::optimizeInsertedLocalLRDpts(std::vector<std::size_t>& valid
                     auto gt_image_cv = tensor_utils::torchTensor2CvMat_Float32(gt_image);
                     cv::cvtColor(gt_image_cv, gt_image_cv, CV_RGB2BGR);
                     gt_image_cv.convertTo(gt_image_cv, CV_8UC3, 255.0f, 0.f);
-                    cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lr_train_depth" / (std::to_string(pkf->fid_)+"_gt.jpg"), gt_image_cv);  
-                
-                    std::cout<<"[GaussianMapper::optimizeInsertedLocalLRDpts] rendered LR depth fid "<<pkf->fid_<<" loss after optimization: "<<batch_loss.item<float>()<<std::endl;
+                    cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lr_train_depth" / ("a_"+std::to_string(pkf->fid_)+"_gt.jpg"), gt_image_cv);  
+                    auto diff_depth = torch::abs(rendered_depth - gt_depth) * this->rendered_depthmap_factor_ * valid_mask;
+                    auto diff_depth_cv = tensor_utils::torchTensor2CvMat_Float32(diff_depth);
+                    diff_depth_cv.convertTo(diff_depth_cv, CV_8UC1, 255.0f/2000.f, 0.f);
+                    cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lr_train_depth" / ("z_"+std::to_string(pkf->fid_)+"_"+std::to_string(i)+"_diff.jpg"), diff_depth_cv);  
+
+                    if(idx == 0)
+                        std::cout<<"[GaussianMapper::optimizeInsertedLocalLRDpts] rendered LR depth fid "<<pkf->fid_<<" loss after optimization: "<<batch_loss.item<float>()<<" iter "<<i<<std::endl;
                     metrics_utils::report_metrics(masked_rendered_image, masked_gt_image, this->lpips_model_);
                 }
             }
@@ -4826,18 +5164,22 @@ void GaussianMapper::optimizeInsertedLocalLRDpts(std::vector<std::size_t>& valid
 }
 
 float GaussianMapper::optimizeLocalHRImgs(std::vector<std::size_t>& random_kfids, std::vector<std::size_t>& valid_fids){
+    // std::unique_lock<std::mutex> lock_render(mutex_render_);
+    
     torch::Tensor loss;
 
     for(int i=0; i<valid_fids.size(); ++i){
-        auto& pkf = this->scene_->keyframes_.at(valid_fids[i]);
+        // auto& pkf = this->scene_->keyframes_.at(valid_fids[i]);
+        auto pkf = this->scene_->getKeyframe(valid_fids[i]); // [debug 20260222]
         this->optimizeLocalHRPose(pkf, false);
     }
 
     int hr_height_resize, hr_width_resize;
     float hr_resize_ratio = this->getRsizedHRScale(1.f, hr_width_resize, hr_height_resize);
     std::unordered_map<std::size_t, torch::Tensor> opacity_masks;
-    for(int i; i < random_kfids.size(); ++i){
-        auto& pkf = this->scene_->keyframes_.at(random_kfids[i]);
+    for(int i=0; i < random_kfids.size(); ++i){
+        // auto& pkf = this->scene_->keyframes_.at(random_kfids[i]);
+        auto pkf = this->scene_->getKeyframe(random_kfids[i]); // [debug 20260222]
 
         auto render_hr_pkg = GaussianRenderer::render(
             pkf,
@@ -4872,7 +5214,7 @@ float GaussianMapper::optimizeLocalHRImgs(std::vector<std::size_t>& random_kfids
         {
             torch::NoGradGuard no_grad;
 
-            gaussians_->updateBatchGradients(valid_fids, 1.5f, 0.8f, true);
+            // gaussians_->updateBatchGradients(valid_fids, 1.5f, 0.8f, true);
             
             gaussians_->optimizer_->step();
             gaussians_->optimizer_->zero_grad(true);
@@ -4892,8 +5234,9 @@ float GaussianMapper::optimizeLocalHRImgs(std::vector<std::size_t>& random_kfids
                 cv::cvtColor(gt_image_cv, gt_image_cv, CV_RGB2BGR);
                 gt_image_cv.convertTo(gt_image_cv, CV_8UC3, 255.0f, 0.f);
                 cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "hr_train_color" / (std::to_string(pkf->fid_)+"_gt.jpg"), gt_image_cv);
-                std::cout<<"[GaussianMapper::optimizeLocalHRImgs] rendered HR img fid "<<pkf->fid_<<" loss after optimization: "<<loss.item<float>()<<std::endl;
-                metrics_utils::report_metrics(masked_rendered_image, masked_gt_image, this->lpips_model_);
+ 
+                std::cout<<"[GaussianMapper::optimizeLocalHRImgs] rendered HR img fid "<<pkf->fid_<<" loss after optimization: "<<loss.item<float>()<<" iter "<<i<<std::endl;
+                metrics_utils::report_metrics(masked_rendered_image, masked_gt_image, this->lpips_model_); 
             }
         }
 
@@ -4901,6 +5244,134 @@ float GaussianMapper::optimizeLocalHRImgs(std::vector<std::size_t>& random_kfids
 
     return loss.item<float>();
 }
+
+void GaussianMapper::insertBatchKeyframes(std::vector<std::size_t>& kfids){
+    std::unique_lock<std::mutex> lock_render(mutex_render_);
+
+    this->local_mapping_batch_ids_[this->local_mapping_batch_ids_.size()] = kfids;
+    // debug all batch ids
+    // for (const auto& [batch_id, ids] : this->local_mapping_batch_ids_) {
+    //     std::cout << "[GaussianMapper::insertBatchKeyframes] Batch ID: " << batch_id << ", Keyframe IDs: ";
+    //     for (const auto& id : ids) {
+    //         std::cout << id << " ";
+    //     }
+    //     std::cout << std::endl;
+    // }
+    // throw std::runtime_error("[GaussianMapper::insertBatchKeyframes] debug stop after printing batch ids.");
+
+    std::vector<torch::Tensor> valid_depth_masks;
+    std::vector<std::size_t> valid_fids;
+
+    for (int i = 0; i < kfids.size(); ++i){
+        std::size_t kfid = kfids[i];
+        this->handleKeyframeFrontend(kfid);
+
+        // auto& new_kf = this->scene_->keyframes_.at(kfid);
+        auto new_kf = this->scene_->getKeyframe(kfid); // [debug 20260222]
+        new_kf->setGTHRImg(this->global_align_time_, this->vstrHRImagePaths_);
+    }
+
+    this->optimizeLocalLRPoses(kfids);
+
+    for (int i = 0; i < kfids.size(); ++i){
+        std::size_t kfid = kfids[i];
+        auto new_kf = this->scene_->getKeyframe(kfid); // [debug 20260222]
+
+        if(!new_kf->has_hr_fid_){
+            std::cout<<"[GaussianMapper::insertBatchKeyframes] warning: no GT HR image for kf id "<<new_kf->fid_<<std::endl;
+            continue;
+        }
+        else std::cout<<"[GaussianMapper::insertBatchKeyframes] set GT HR image for kf id "<<new_kf->fid_<<" hr fid "<<new_kf->hr_fid_<<std::endl;
+
+        // this->optimizeLocalLRPose(new_kf, false); // if use ba, disable this // [test20260213] disable LR pnp
+
+        valid_depth_masks.push_back(this->getLocalLRValidDptMsk(new_kf));
+        valid_fids.push_back(kfid);
+
+        if(valid_fids.size() >= this->local_align_batch_size_) break;
+    }
+    
+
+    if(valid_fids.size() == 0){
+        throw std::runtime_error("[GaussianMapper::insertBatchKeyframes] no valid keyframe to insert after checking GT HR images.");
+    }
+
+    int max_pixel_fid = this->insertLocalLRValidDpts(valid_depth_masks, valid_fids);
+
+    // if (max_pixel_fid < 0) return;
+
+    if(kf_params_.debug_){
+        torch::NoGradGuard no_grad;
+        CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lrhr_add_pcd"))
+        for(int i=0; i<valid_fids.size(); ++i){
+            // auto& pkf = this->scene_->keyframes_.at(valid_fids[i]);
+            auto pkf = this->scene_->getKeyframe(valid_fids[i]); // [debug 20260222]
+
+            auto render_pkg = GaussianRenderer::render(pkf,
+                this->kf_params_.hr_height_/2, this->kf_params_.hr_width_/2,
+                this->gaussians_, this->pipe_params_,
+                this->background_, this->override_color_,
+                true, false, false, false
+            );
+            auto rendered_image = std::get<0>(render_pkg);
+            auto gt_image = pkf->getGTHRImg(0.5f);
+            auto image_cv = tensor_utils::torchTensor2CvMat_Float32(rendered_image);
+            cv::cvtColor(image_cv, image_cv, CV_RGB2BGR);
+            image_cv.convertTo(image_cv, CV_8UC3, 255.0f, 0.f);
+            cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lrhr_add_pcd" / (std::to_string(valid_fids[i])+".jpg"), image_cv); 
+            auto gt_image_cv = tensor_utils::torchTensor2CvMat_Float32(gt_image);
+            cv::cvtColor(gt_image_cv, gt_image_cv, CV_RGB2BGR);
+            gt_image_cv.convertTo(gt_image_cv, CV_8UC3, 255.0f, 0.f);
+            cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lrhr_add_pcd" / (std::to_string(valid_fids[i])+"_gt.jpg"), gt_image_cv);
+        
+            render_pkg = GaussianRenderer::render(pkf,
+                this->kf_params_.lr_height_, this->kf_params_.lr_width_,
+                this->gaussians_, this->pipe_params_,
+                this->background_, this->override_color_,
+                false, false, false, false
+            );
+            auto rendered_image_lr = std::get<0>(render_pkg);
+            auto gt_image_lr = pkf->getGTLRImg();
+            auto image_cv_lr = tensor_utils::torchTensor2CvMat_Float32(rendered_image_lr);
+            cv::cvtColor(image_cv_lr, image_cv_lr, CV_RGB2BGR);
+            image_cv_lr.convertTo(image_cv_lr, CV_8UC3, 255.0f, 0.f);
+            cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lrhr_add_pcd" / (std::to_string(valid_fids[i])+"_lr.jpg"), image_cv_lr); 
+            auto gt_image_cv_lr = tensor_utils::torchTensor2CvMat_Float32(gt_image_lr);
+            cv::cvtColor(gt_image_cv_lr, gt_image_cv_lr, CV_RGB2BGR);
+            gt_image_cv_lr.convertTo(gt_image_cv_lr, CV_8UC3, 255.0f, 0.f);
+            cv::imwrite(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lrhr_add_pcd" / (std::to_string(valid_fids[i])+"_lr_gt.jpg"), gt_image_cv_lr);
+        }
+
+        CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lr_add_ply"))
+        if (max_pixel_fid >= 0)
+            this->gaussians_->savePly(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lr_add_ply" / (std::to_string(max_pixel_fid)+"_before.ply"));
+        else 
+            this->gaussians_->savePly(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lr_add_ply" / (std::to_string(valid_fids[0])+"_invalid_before.ply"));
+    }
+
+    // return; // [test20260213] disable HR
+
+    // throw std::runtime_error("[GaussianMapper::insertBatchKeyframes] debug stop after inserting valid depth points, check inserted points and metrics, then continue.");
+
+    if (max_pixel_fid > 0) this->optimizeInsertedLocalLRDpts(valid_fids, valid_depth_masks);
+
+    // return; // [test20260213] disable HR
+
+    int random_iters = max_pixel_fid > 0 ? this->local_align_batch_size_ * this->local_align_batch_color_periter_ : this->local_align_batch_color_periter_;
+    std::vector<std::size_t> batch_hr_color_fids;
+    this->getBatchShuffledFrameIds(valid_fids, batch_hr_color_fids, random_iters);
+
+    this->optimizeLocalHRImgs(batch_hr_color_fids, valid_fids);
+
+    std::cout<<"[debug] finish check"<<std::endl;
+    if(kf_params_.debug_){
+        CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lr_add_ply"))
+        this->gaussians_->savePly(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lr_add_ply" / (std::to_string(max_pixel_fid)+"_after.ply"));
+    }
+
+    // throw std::runtime_error("[GaussianMapper::insertBatchKeyframes] disable local HR optimization for now.");
+}
+
 
 void GaussianMapper::insertBatchKeyframes(
     std::vector<std::shared_ptr<KeyframeFrontend>>& kfs, 
@@ -4939,7 +5410,8 @@ void GaussianMapper::insertBatchKeyframes(
         torch::NoGradGuard no_grad;
         CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS((result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lrhr_add_pcd"))
         for(int i=0; i<valid_fids.size(); ++i){
-            auto& pkf = this->scene_->keyframes_.at(valid_fids[i]);
+            // auto& pkf = this->scene_->keyframes_.at(valid_fids[i]);
+            auto pkf = this->scene_->getKeyframe(valid_fids[i]); // [debug 20260222]
 
             auto render_pkg = GaussianRenderer::render(pkf,
                 this->kf_params_.hr_height_/2, this->kf_params_.hr_width_/2,
@@ -4980,7 +5452,7 @@ void GaussianMapper::insertBatchKeyframes(
         this->gaussians_->savePly(result_dir_ / (std::to_string(getIteration()) + "-" + std::to_string(this->local_mapping_operations_.size())  + kf_params_.debug_dir_) / "lr_add_ply" / (std::to_string(max_pixel_fid)+"_before.ply"));
     }
 
-    this->optimizeInsertedLocalLRDpts(valid_fids);
+    this->optimizeInsertedLocalLRDpts(valid_fids, valid_depth_masks);
 
     throw std::runtime_error("[GaussianMapper::insertBatchKeyframes] disable local HR optimization for now.");
 
@@ -4995,6 +5467,7 @@ void GaussianMapper::insertBatchKeyframes(
     }
 
 }
+
 
 void GaussianMapper::insertLocalLRValidDpt(std::shared_ptr<GaussianKeyframe> pkf){
     auto valid_depth_mask = this->getLocalLRValidDptMsk(pkf);
@@ -6006,6 +6479,31 @@ void GaussianMapper::trainForOneIteration()
             viewpoint_cam->updateLocalDeltaPose();
         }
     }
+}
+
+void GaussianMapper::waitUntilFinished() {
+    std::cout << "[GaussianMapper::waitUntilFinished] Waiting for mapper to process all frames..." << std::endl;
+
+    while (!isStopped()) {
+        std::vector<std::size_t> tracking_ids, mapping_ids;
+
+        if(this->pCuVSLAM_->IsTrackingFinished()) {
+            this->pCuVSLAM_->GetFrameIds(tracking_ids);
+            this->scene_->getKeyframeIds(mapping_ids);
+
+            std::cout << "[GaussianMapper::waitUntilFinished] Tracking frames: " << tracking_ids.size() 
+                  << ", Mapped frames: " << mapping_ids.size() << std::endl;
+
+            if (mapping_ids.size() >= tracking_ids.size()) {
+                std::cout << "[GaussianMapper::waitUntilFinished] All frames mapped. Mapper finished." << std::endl;
+                break;
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    }
+
+    std::cout << "[GaussianMapper::waitUntilFinished] Wait complete." << std::endl;
 }
 
 bool GaussianMapper::isStopped()

@@ -138,7 +138,12 @@ inline torch::Tensor get_loss_rgb(torch::Tensor sampling_map,
     torch::Tensor mask = torch::Tensor(),
     torch::DeviceType device_type = torch::kCUDA
 ){
+    if(rendered_rgb.device() != device_type) rendered_rgb = rendered_rgb.to(device_type);
+    if(gt_rgb.device() != device_type) gt_rgb = gt_rgb.to(device_type);
+
     if(exposure_a.defined() && exposure_b.defined()){
+        if (exposure_a.device() != device_type) exposure_a = exposure_a.to(device_type);
+        if (exposure_b.device() != device_type) exposure_b = exposure_b.to(device_type);
         rendered_rgb = rendered_rgb * torch::exp(exposure_a) + exposure_b;
         rendered_rgb = torch::clamp(rendered_rgb, 0.0f, 1.0f);
     }
@@ -146,6 +151,8 @@ inline torch::Tensor get_loss_rgb(torch::Tensor sampling_map,
     torch::Tensor l1, ssim_map;
     
     if (mask.defined()) {
+        if (mask.device() != device_type) mask = mask.to(device_type);
+
         auto masked_rendered_rgb = rendered_rgb * mask;
         auto masked_gt_rgb = gt_rgb * mask;
         // l1 = l1_loss(masked_rendered_rgb, masked_gt_rgb);
@@ -189,13 +196,19 @@ inline torch::Tensor get_loss_rgb(
     torch::Tensor mask = torch::Tensor(),
     torch::DeviceType device_type = torch::kCUDA
 ){
+    if(rendered_rgb.device() != device_type) rendered_rgb = rendered_rgb.to(device_type);
+    if(gt_rgb.device() != device_type) gt_rgb = gt_rgb.to(device_type);
+
     if(exposure_a.defined() && exposure_b.defined()){
+        if (exposure_a.device() != device_type) exposure_a = exposure_a.to(device_type);
+        if (exposure_b.device() != device_type) exposure_b = exposure_b.to(device_type);
         rendered_rgb = rendered_rgb * torch::exp(exposure_a) + exposure_b;
         rendered_rgb = torch::clamp(rendered_rgb, 0.0f, 1.0f);
     }
 
     torch::Tensor l1, ssim_map;
     if (mask.defined()) {
+        if (mask.device() != device_type) mask = mask.to(device_type);
         auto masked_abs = torch::abs(rendered_rgb - gt_rgb);// * mask;
         l1 = masked_abs.masked_select(mask > 0).mean();
         // l1 = (l1 * mask).mean();
@@ -217,8 +230,12 @@ inline torch::Tensor get_loss_depth(
     torch::Tensor mask = torch::Tensor(),
     torch::DeviceType device_type = torch::kCUDA
 ){
+    if(rendered_depth.device() != device_type) rendered_depth = rendered_depth.to(device_type);
+    if(gt_depth.device() != device_type) gt_depth = gt_depth.to(device_type);
+
     torch::Tensor loss_d;
     if (mask.defined()) {
+        if (mask.device() != device_type) mask = mask.to(device_type);
         loss_d = torch::abs(rendered_depth - gt_depth);
         loss_d = loss_d.masked_select(mask > 0).mean();
     } else {

@@ -48,6 +48,8 @@ public:
 
     int getPointNumber();
 
+    bool getKeyframeIds(std::vector<std::size_t>& keyframe_ids);
+
     void addKeyframe(std::shared_ptr<GaussianKeyframe> new_kf, bool* shuffled);
     std::shared_ptr<GaussianKeyframe> getKeyframe(std::size_t fid);
     std::map<std::size_t, std::shared_ptr<GaussianKeyframe>>& keyframes();
@@ -76,7 +78,7 @@ public:
     std::map<std::size_t, std::shared_ptr<GaussianKeyframe>> keyframes_;
     std::map<point3D_id_t, Point3D> cached_point_cloud_;
 
-    std::vector<std::size_t> keyframes_ids_;
+    std::set<std::size_t> keyframes_ids_;
 
 protected:
     std::mutex mutex_kfs_;

@@ -151,7 +151,7 @@ public:
 
     int lr_width_, lr_height_;
     float lr_fx_, lr_fy_, lr_cx_, lr_cy_;
-    float lr_fps_;
+    float lr_fps_, lr_depth_factor_;
 
     float hr_fovx_;
     float hr_fovy_;

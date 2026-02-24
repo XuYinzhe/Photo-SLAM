@@ -48,6 +48,8 @@
 #include "ORB-SLAM3/include/ORBextractor.h"
 #include "ORB-SLAM3/Thirdparty/Sophus/sophus/se3.hpp"
 
+#include "include/cuvslam_tracker.h"
+
 #include "third_party/Connected_components_PyTorch/cpp/buf.h"
 
 // #include <pcl/point_types.h>
@@ -134,15 +136,26 @@ public:
         std::filesystem::path result_dir = "",
         int seed = 0,
         torch::DeviceType device_type = torch::kCUDA);
+    
+    GaussianMapper(
+        std::shared_ptr<CuVSLAMTracker> pSLAM,
+        std::filesystem::path gaussian_config_file_path,
+        std::filesystem::path result_dir = "",
+        int seed = 0,
+        torch::DeviceType device_type = torch::kCUDA);
+
+    ~GaussianMapper();
 
     void readConfigFromFile(std::filesystem::path cfg_path);
 
     void run();
+    void run_cuvslam();
     void trainColmap();
     void trainForOneIteration();
 
     bool isStopped();
     void signalStop(const bool going_to_stop = true);
+    void waitUntilFinished();
 
     cv::Mat renderFromPose(
         const Sophus::SE3f &Tcw,
@@ -228,7 +241,8 @@ protected:
 
     // cv::Mat sampleDepthMap(const cv::Mat& depth);
     // void cacheSampledDepthMap(std::shared_ptr<GaussianKeyframe> pkf, Sophus::SE3<float>& pose);
-    void cacheKeyframeDepthMap();
+    void cacheKeyframeDepthMap(std::vector<std::size_t> kfids = {});
+    void testCacheAllKeyframeDepthMap();
     cv::Mat getDepthRelated(std::shared_ptr<GaussianKeyframe> pkf1, std::shared_ptr<GaussianKeyframe> pkf2, 
         Sophus::SE3f pose1, Sophus::SE3f pose2);
     cv::Mat getDepthRelated(std::shared_ptr<GaussianKeyframe> pkf1, std::shared_ptr<GaussianKeyframe> pkf2, 
@@ -258,6 +272,7 @@ protected:
     // torch::Tensor refinePoseFastVGICP(std::shared_ptr<GaussianKeyframe> pkf);
 
     std::size_t handleKeyframeFrontend(KeyframeFrontend& kf, std::shared_ptr<GaussianKeyframe> new_kf, float timestamp);
+    std::size_t handleKeyframeFrontend(std::size_t kfid);
     float getRsizedHRScale(float ratio, int& out_width, int& out_height);
     // current methods only use diff or classic, ours hyper robust to more situations, for tracking contribution
     void getBatchShuffledFrameIds(const std::vector<std::size_t>& in_fids, std::vector<std::size_t>& out_fids, int required_iters);
@@ -265,10 +280,12 @@ protected:
     float optimizeGlobalLRImg(std::shared_ptr<GaussianKeyframe> pkf, int i);
     float optimizeGlobalHRPose(std::shared_ptr<GaussianKeyframe> pkf, bool use_differential_pose = true);
     float optimizeLocalLRPose(std::shared_ptr<GaussianKeyframe> pkf, bool use_differential_pose = true);
+    float optimizeLocalLRPoses(std::vector<std::size_t>& fids);
     float optimizeLocalHRPose(std::shared_ptr<GaussianKeyframe> pkf, bool use_differential_pose = true);
+    float optimizeLocalHRPoses(std::vector<std::size_t>& fids);
     torch::Tensor getLocalLRValidDptMsk(std::shared_ptr<GaussianKeyframe> pkf);
     int insertLocalLRValidDpts(std::vector<torch::Tensor>& valid_depth_masks, std::vector<std::size_t>& valid_fids);
-    void optimizeInsertedLocalLRDpts(std::vector<std::size_t>& valid_fids);
+    void optimizeInsertedLocalLRDpts(std::vector<std::size_t>& valid_fids, std::vector<torch::Tensor>& valid_depth_masks);
     void insertLocalLRValidDpt(std::shared_ptr<GaussianKeyframe> pkf);
     float optimizeLocalHRImgs(std::vector<std::size_t>& random_kfids, std::vector<std::size_t>& valid_fids);
     float optimizeLocalHRImg(std::shared_ptr<GaussianKeyframe> pkf);
@@ -289,6 +306,7 @@ protected:
     void insertBatchKeyframes(
         std::vector<std::shared_ptr<KeyframeFrontend>>& kfs, 
         std::vector<double>& timestamps);
+    void insertBatchKeyframes(std::vector<std::size_t>& kfids);
 
     // void undistortKeyframe(std::shared_ptr<GaussianKeyframe> pkf, std::size_t camera_id);
     void generatePyramidSizes(std::shared_ptr<GaussianKeyframe> pkf, const Camera& camera);
@@ -336,6 +354,7 @@ public:
 
     // SLAM system
     std::shared_ptr<ORB_SLAM3::System> pSLAM_;
+    std::shared_ptr<CuVSLAMTracker> pCuVSLAM_;
 
     // Settings
     torch::DeviceType device_type_;
@@ -431,6 +450,7 @@ protected:
     torch::Tensor dense_height_map_tensor_, dense_width_map_tensor_;
 
     // global alignment
+    bool wait_frontend_finish_;
     int init_train_iter_;
     int max_pnp_render_attempts_ = 3;
     int global_align_lr_pose_iter_;
@@ -454,6 +474,7 @@ protected:
 
     // local alignment
     std::vector<std::map<ORB_SLAM3::MappingOperation::OprType, std::vector<std::size_t>>> local_mapping_operations_;
+    std::map<std::size_t, std::vector<std::size_t>> local_mapping_batch_ids_;
     int local_align_lr_pose_iter_;
     int local_align_lr_iter_;
     float local_align_lr_opcacity_thr_;

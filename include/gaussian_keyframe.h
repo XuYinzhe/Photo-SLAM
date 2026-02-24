@@ -102,11 +102,15 @@ public:
         const double qz,
         const double tx,
         const double ty,
-        const double tz);
+        const double tz,
+        bool inverse = false
+    );
     
     void setPose(
         const Eigen::Quaterniond& q,
-        const Eigen::Vector3d& t);
+        const Eigen::Vector3d& t,
+        bool inverse = false
+    );
 
     void setGTPose(
         const double qw,
@@ -126,8 +130,8 @@ public:
     torch::Tensor getGTLRDpt(bool use_cuda = false);
     torch::Tensor getGTLRDptMsk(bool use_cuda = false);
 
-    void setGTLRDpt(cv::Mat& depth_img);
-    void setGTLRImg(cv::Mat& color_img);
+    void setGTLRDpt(cv::Mat& depth_img, bool need_preprocess = false);
+    void setGTLRImg(cv::Mat& color_img, bool need_preprocess = false);
     bool setGTHRImg(float align_time, std::vector<std::string>& hr_img_filenames);
     torch::Tensor getGTHRImg(float resize_ratio = 1.0f, bool use_cuda = false);
     torch::Tensor getGTHRImg(torch::Tensor& selection_indices, float resize_ratio = 1.0f, bool use_cuda = false);

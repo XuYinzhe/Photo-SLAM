@@ -112,6 +112,7 @@ public:
         bool fixed_unmasked_geo = true,
         bool fixed_unmasked_clr = true);
     void updateKeyframeJointPcd(std::shared_ptr<GaussianKeyframe> pkf, 
+        torch::Tensor& updated_pose,
         torch::Tensor& delta_pose,
         torch::Tensor& joint_mask);
 

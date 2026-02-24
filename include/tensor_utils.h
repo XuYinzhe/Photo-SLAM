@@ -522,4 +522,25 @@ inline torch::Tensor predict_pose_cubic_hermite(
     return T_delta;
 }
 
+inline torch::Tensor average_poses(std::vector<torch::Tensor> poses, std::vector<float> weights = {}) {
+    std::vector<torch::Tensor> omegas, rhos;
+    for (const auto& pose : poses) {
+        auto [omega, rho] = se3_log(pose);
+        omegas.push_back(omega);
+        rhos.push_back(rho);
+    }
+    
+    torch::Tensor omega_avg, rho_avg;
+    if (weights.empty()) {
+        omega_avg = torch::stack(omegas).mean(0);
+        rho_avg = torch::stack(rhos).mean(0);
+    } else {
+        torch::Tensor weight_tensor = torch::tensor(weights, torch::dtype(torch::kFloat32).device(poses[0].device())).unsqueeze(1);
+        omega_avg = torch::stack(omegas).mul(weight_tensor).sum(0) / weight_tensor.sum();
+        rho_avg = torch::stack(rhos).mul(weight_tensor).sum(0) / weight_tensor.sum();
+    }
+
+    return se3_exp(omega_avg, rho_avg);
+}
+
 } // namespace tensor_utils

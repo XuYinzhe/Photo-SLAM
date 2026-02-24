@@ -310,6 +310,9 @@ void GaussianModel::createFromPcd(
     torch::Tensor fused_point_cloud = xyz.to(device_type_);
     torch::Tensor color = rgb.to(device_type_);
 
+// add 0.05 on y axis for testing
+// fused_point_cloud.index({torch::indexing::Slice(), 1}).add_(0.03f);
+
     // sh color
     torch::Tensor fused_color = sh_utils::RGB2SH(color);
     auto temp = this->max_sh_degree_ + 1;
@@ -325,8 +328,6 @@ void GaussianModel::createFromPcd(
          torch::indexing::Slice(3, features.size(1)),
          torch::indexing::Slice(1, features.size(2))}) = 0.0f;
 
-    // std::cout << "[Gaussian Model]Number of points at initialization : " << fused_point_cloud.size(0) << std::endl;
-
     // scaling
     torch::Tensor point_cloud_copy = fused_point_cloud.clone();
     torch::Tensor dist2 = torch::clamp_min(distCUDA2(point_cloud_copy), 0.0000001);
@@ -335,7 +336,10 @@ void GaussianModel::createFromPcd(
     clmap_dist = torch::clamp_max(clmap_dist, 3.0f * median_scale);
     torch::Tensor scales = torch::log(clmap_dist);
     auto scales_ndimension = scales.ndimension();
+    auto min_scale = scales.min().item<float>();
     scales = scales.unsqueeze(scales_ndimension).repeat({1, 3});
+// fill scales in z axis with the minimum/100
+scales.index({torch::indexing::Slice(), 2}).fill_(min_scale/1e-2f);
 
     // rotation
     torch::Tensor rots = torch::zeros({fused_point_cloud.size(0), 4}, torch::TensorOptions().device(device_type_));
@@ -578,7 +582,7 @@ void GaussianModel::increaseKeyframeInitPcd(std::shared_ptr<GaussianKeyframe> pk
         full_rgb = full_rgb.to(this->device_type_);
     }
 
-    valid_depth = valid_depth.squeeze();
+    valid_depth = valid_depth.squeeze().contiguous(); // H x W
     auto valid_indices = torch::where(valid_depth > 0.f);
     auto valid_v = valid_indices[0];
     auto valid_u = valid_indices[1];
@@ -591,14 +595,28 @@ void GaussianModel::increaseKeyframeInitPcd(std::shared_ptr<GaussianKeyframe> pk
     std::cout<<"[GaussianModel::increaseKeyframeInitPcd] add pcd from keyframe fid: "<<pkf->fid_<<std::endl;
     std::cout<<"[debug] valid_v sizes: "<<valid_v.sizes()<<std::endl;
     std::cout<<"[debug] valid_u sizes: "<<valid_u.sizes()<<std::endl;
+    // std::cout<<"[debug] max min valid_v: "<<valid_v.max().item<int>()<<" "<<valid_v.min().item<int>()<<std::endl;
+    // std::cout<<"[debug] max min valid_u: "<<valid_u.max().item<int>()<<" "<<valid_u.min().item<int>()<<std::endl;
+    // std::cout<<"[debug] depth sizes: "<<valid_depth.sizes()<<" rgb sizes: "<<full_rgb.sizes()<<std::endl;
+    // std::cout<<"[debug] lr_width lr_height: "<<kf_params.lr_width_<<" "<<kf_params.lr_height_<<std::endl;
+    // std::cout<<"[debug] fxfycxcy: "<<kf_params.lr_fx_<<" "<<kf_params.lr_fy_<<" "<<kf_params.lr_cx_<<" "<<kf_params.lr_cy_<<std::endl;
+    // std::cout<<"[debug] first 10 u v: "<<valid_u.index({torch::indexing::Slice(0, 10)})<<" "<<valid_v.index({torch::indexing::Slice(0, 10)})<<std::endl;
 
     auto Pc = torch::stack({x, y, z}, /*dim=*/1); // N x 3
+    // auto zero = torch::zeros({1, 3}, Pc.options());
+    // auto axis_x = torch::tensor({1.f, 0.f, 0.f}, Pc.options()).unsqueeze(0);
+    // auto axis_y = torch::tensor({0.f, 1.f, 0.f}, Pc.options()).unsqueeze(0);
+    // auto axis_z = torch::tensor({0.f, 0.f, 1.f}, Pc.options()).unsqueeze(0);
+    // Pc = torch::cat({Pc, zero}, /*dim=*/0);
+    // Pc = torch::cat({Pc, axis_x, axis_y, axis_z}, /*dim=*/0); // (N+4) x 3
     auto Pc_homo = torch::cat({Pc, torch::ones({Pc.size(0), 1}, Pc.options())}, /*dim=*/1); // N x 4
     auto Pw = pkf->getBasePose().inverse().mm(Pc_homo.transpose(0,1));
+    std::cout<<"[debug 02192041] pcd pose:\n"<<pkf->getBasePose()<<" id "<<pkf->fid_<<std::endl;
     Pw = Pw.transpose(0,1).index({torch::indexing::Slice(), torch::indexing::Slice(0, 3)}).contiguous();
 
-    auto rgb_values = full_rgb.view({3, -1}).index_select(1, linear_idx).transpose(0, 1);  // N x 3
-    // auto rgb_values = full_rgb.view({-1, 3}).index_select(0, linear_idx);  // N x 3
+    auto rgb_values = full_rgb.view({3, -1}).index_select(1, linear_idx).transpose(0, 1).contiguous();  // N x 3
+    // rgb_values = torch::cat({rgb_values, torch::ones({1, 3}, rgb_values.options())}, /*dim=*/0);
+    // rgb_values = torch::cat({rgb_values, axis_x, axis_y, axis_z}, /*dim=*/0); // (N+4) x 3
 
     torch::Tensor xyz, rgb, opacity, scaling, rotation, features_dc, features_rest;
 
@@ -606,8 +624,9 @@ void GaussianModel::increaseKeyframeInitPcd(std::shared_ptr<GaussianKeyframe> pk
     // pkf->dense_init_rgb_ = rgb_values.clone();
     xyz = Pw.clone();
     rgb = rgb_values.clone();
+    std::cout<<"[debug] xyz sizes: "<<xyz.sizes()<<" rgb sizes: "<<rgb.sizes()<<std::endl; // N x 3
 
-    tensor_utils::initGaussianOpacity(xyz, opacity, 0.6f);
+    tensor_utils::initGaussianOpacity(xyz, opacity, 0.3f);
     tensor_utils::initGaussianRotation(xyz, rotation);
     tensor_utils::initGaussianScaling(xyz, scaling, 2.f);
     tensor_utils::initGaussianFeatures(rgb, features_dc, features_rest);
@@ -665,32 +684,53 @@ void GaussianModel::increaseKeyframeInitPcd(std::shared_ptr<GaussianKeyframe> pk
 }
 
 void GaussianModel::updateKeyframeJointPcd(std::shared_ptr<GaussianKeyframe> pkf, 
+    torch::Tensor& updated_pose,
     torch::Tensor& delta_pose,
     torch::Tensor& joint_mask
 ){
-    const auto& xyz = this->getXYZ();
+    // the pose is already updated, but the xyz is not updated yet. We want to update the xyz according to the new pose, but only for the points that belong to this keyframe (joint_mask). The points that do not belong to this keyframe should remain unchanged.
+    const auto& Pw = this->getXYZ();
 
     if(!joint_mask.defined()){
         joint_mask = (this->frame_ids_ == static_cast<int64_t>(pkf->fid_)).to(torch::kFloat32).unsqueeze(1); // [N, 1]
-        joint_mask = joint_mask.expand_as(xyz); // [N, 3]
+        joint_mask = joint_mask.expand_as(Pw); // [N, 3]
     }
+    if(joint_mask.sum().item<float>() < 1.f){
+        // no points to update
+        return;
+    }
+// std::cout<<"[debug] joint_mask sum: "<<joint_mask.sum().item<float>()<<" id "<<pkf->fid_<<std::endl;
 
-    auto T_new = pkf->getBasePose();
-    auto T_old = delta_pose.inverse().mm(T_new); 
-    auto frame_pose = T_new.inverse().mm(T_old);
-    // std::cout<<"[debug] T_old\n"<<T_old<<std::endl;
-    // std::cout<<"[debug] T_new\n"<<T_new<<std::endl;
-    // std::cout<<"[debug] frame_pose\n"<<frame_pose<<std::endl;
+    auto new_Tcw = updated_pose; // new world to camera
+    auto new_Twc = new_Tcw.inverse(); // new camera to world
+    auto old_Tcw = delta_pose.inverse().mm(new_Tcw); // old wrold to camera
+// std::cout<<"[debug] new_Tcw:\n"<<new_Tcw<<std::endl;
+// std::cout<<"[debug] delta_pose:\n"<<delta_pose<<std::endl;
+// std::cout<<"[debug] old_Tcw:\n"<<old_Tcw<<std::endl;
 
-    // const auto frame_pose = delta_pose; // [4,4]
+    /*
+    auto R1 = old_Tcw.index({torch::indexing::Slice(0,3), torch::indexing::Slice(0,3)}); // [3,3]
+    auto t1 = old_Tcw.index({torch::indexing::Slice(0,3), 3}); // [3]
+    auto R2 = delta_pose.index({torch::indexing::Slice(0,3), torch::indexing::Slice(0,3)}); // [3,3]
+    auto t2 = delta_pose.index({torch::indexing::Slice(0,3), 3}); // [3]
+    auto R3 = new_Twc.index({torch::indexing::Slice(0,3), torch::indexing::Slice(0,3)}); // [3,3]
+    auto t3 = new_Twc.index({torch::indexing::Slice(0,3), 3}); // [3]
+
+    // old pcd in world -> old pcd in old camera -> old pcd in new camera -> new pcd in world
+    auto old_Pc = R1.mm(Pw.t()).transpose(0,1) + t1.unsqueeze(0); // [N,3]
+    auto new_Pc = R2.mm(old_Pc.t()).transpose(0,1) + t2.unsqueeze(0); // [N,3]
+    auto new_Pw = R3.mm(new_Pc.t()).transpose(0,1) + t3.unsqueeze(0); // [N,3]
+    */
+
+    // auto frame_pose = new_Twc.mm(delta_pose).mm(old_Tcw);
+    auto frame_pose = old_Tcw.inverse().mm(new_Tcw);
     auto R = frame_pose.index({torch::indexing::Slice(0,3), torch::indexing::Slice(0,3)}); // [3,3]
     auto t = frame_pose.index({torch::indexing::Slice(0,3), 3}); // [3]
-    // std::cout<<"[debug] R sizes: "<<R.sizes()<<std::endl;
-    // std::cout<<"[debug] t sizes: "<<t.sizes()<<std::endl;
 
-    auto joint_xyz = torch::matmul(xyz, R.t()) + t.unsqueeze(0);  // [N,3]
+    // auto joint_xyz = torch::matmul(xyz, R.t()) + t.unsqueeze(0);  // [N,3]
     
-    xyz.mul_(1.0f - joint_mask).add_(joint_xyz * joint_mask);
+    auto new_Pw = R.mm(Pw.t()).transpose(0,1) + t.unsqueeze(0); // [N,3]
+    Pw.mul_(1.0f - joint_mask).add_(new_Pw * joint_mask);
 }
 
 /*
@@ -757,6 +797,11 @@ int GaussianModel::updateBatchGradients(
                     .any(1, /*keepdim=*/false)
                     .to(torch::kFloat32)
                     .unsqueeze(1); // ensure [N,1]
+
+    if (mask.sum().item<int>() == 0) {
+        // No points belong to the batch frames, skip gradient scaling
+        return 0;
+    }
 
     // Broadcast-shape helper
     auto expand_to = [&](const at::Tensor& src) {
