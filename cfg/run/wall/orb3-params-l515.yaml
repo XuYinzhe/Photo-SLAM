@@ -14,8 +14,8 @@ Camera.type: "PinHole"
 # [ 640x480  p[316.782 252.758]  f[598.523 598.536]  Brown Conrady [0.164598 -0.54137 -0.00021399 0.000104269 0.48068] ]
 Camera1.fx: 598.523
 Camera1.fy: 598.536
-Camera1.cx: 316.782
-Camera1.cy: 252.758
+Camera1.cx: 319.4 # 318.4 320.4
+Camera1.cy: 239.5 # 238.6 240.5
 
 # L515 already undistorted
 Camera1.k1: 0.0

@@ -13,7 +13,7 @@ Model.eval: 0  # 0:false, 1 or other integer:true
 # Pipeline Parameters
 #--------------------------------------------------------------------------------------------
 
-Camera.z_near: 0.01
+Camera.z_near: 0.001
 Camera.z_far: 100.0
 Monocular.inactive_geo_densify_max_pixel_dist: 1.0 # (squared distance)
 Stereo.min_disparity: 8
@@ -77,6 +77,7 @@ Optimization.densify_until_iter: 30000
 Optimization.densify_grad_threshold: 0.001
 
 # Alignment
+Optimization.wait_frontend_finish: 0 # 0: false, 1: true
 Optimization.init_train_iter: 0
 Optimization.global_align_lr_pose_iter: 20
 Optimization.global_align_lr_iter: 30
@@ -85,7 +86,7 @@ Optimization.global_align_hr_iter: 30
 Optimization.global_align_hr_warmup_iter: 40
 Optimization.global_align_hr_warmup_lr_dump: 0.6
 Optimization.global_align_hr_resize_ratio: 0.5
-Optimization.global_align_time_window_ratio: 1.5
+Optimization.global_align_time_window_ratio: 2.0
 Optimization.global_align_opacity_thr: 0.94
 Optimization.global_align_hr_opacity_thr: 0.5
 Optimization.global_align_hr_pose_lambda: 1.0 # 1.4
@@ -104,7 +105,7 @@ Optimization.dense_diff_threshold_ratio: 1.75
 Optimization.local_align_lr_pose_iter: 20
 Optimization.local_align_lr_iter: 30
 Optimization.local_align_lr_opacity_thr: 0.7
-Optimization.local_align_lr_joint_pose_iter: 40
+Optimization.local_align_lr_joint_pose_iter: 30
 Optimization.local_align_lr_joint_pose_dump: 0.2
 Optimization.local_align_hr_resize_ratio: 0.5
 Optimization.local_align_hr_pose_iter: 30
