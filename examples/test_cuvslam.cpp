@@ -1,4 +1,4 @@
-#include "third_party/cuvlsam/include/cuvslam/cuvslam2.h"
+#include "third_party/cuvslam/include/cuvslam/cuvslam2.h"
 
 #include <iostream>
 #include <fstream>
